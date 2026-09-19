@@ -10,7 +10,7 @@ Training code is provided for both PyTorch and TensorFlow.
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/yamak493/nlf/blob/claude/kind-mendel-tdveor/mp4_to_mannequin_ja.ipynb)
 
-`mp4_to_mannequin_ja.ipynb` は、mp4 をファイル選択でアップロードし、始点秒数〜終点秒数を指定するだけで
+`mp4_to_mannequin_ja.ipynb` は、入力の mp4 を URL（既定: `https://made-by-free.com/night-fire.mp4`）からダウンロードし、始点秒数〜終点秒数を指定するだけで
 
 1. NLF v0.3.2 の学習済みモデル（自動ダウンロード）でモーションを抽出し（`motion.npz`）、
 2. そのモーションを反映したマネキンをレンダリングして、
