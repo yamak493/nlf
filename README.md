@@ -14,7 +14,8 @@ Training code is provided for both PyTorch and TensorFlow.
 
 1. NLF v0.3.2 の学習済みモデル（自動ダウンロード）でモーションを抽出し（`motion.npz`）、
 2. そのモーションを反映したマネキンをレンダリングして、
-3. 元動画の音声付き mp4 として書き出す
+3. 元動画の音声付き mp4 として書き出し、
+4. モーションを FBX（`motion.fbx`：スケルトン＋スキン付きマネキン＋アニメーション）でも書き出す
 
 という一連の処理を行う日本語ノートブックです。SMPL 公式ファイルが無くても動作します
 （[SMPLFitter](https://github.com/isarandi/smplfitter) は NLF の内部でも使われています）。
