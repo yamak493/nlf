@@ -1,0 +1,99 @@
+# NLF → VMD 変換の設定（初期値）。仕様は vmd.md を参照。
+#
+# * このファイルをコピーして値を書き換え、--config で渡すと上書きできます（書いた項目だけ変わります）。
+# * コマンドラインの --set jitter.outlier_deg_per_s=540 のように 1 項目ずつ変えることもできます。
+# * 長さのしきい値はメートルで書きます。ステージ5以降は内部でスケール係数を掛けて使います。
+# * One Euro フィルタの min_cutoff [Hz] を小さくするほど強く平滑化し、beta を大きくするほど
+#   速い動きで平滑化が弱まります（キレが残ります）。
+
+# ---- 1. 読み込み・正規化 ----
+input:
+  coords: auto              # auto | camera（Y下向き・Z奥向き）| yup（Y上向き・右手系）。auto は入力の coord_system、無ければ camera
+  person_index: 0           # 複数人物が含まれる場合に扱う人物の番号
+  target_fps: 30.0          # リサンプル先の fps（MMD は 30fps）
+
+# ---- 2. 姿勢のジッター制御 ----
+jitter:
+  outlier_deg_per_s: 720.0  # これを超える角速度の単独フレームを前後から補間して置き換える
+  one_euro:
+    d_cutoff: 1.0
+    zero_phase: true        # 順方向と逆方向の平均で遅れを打ち消す
+    groups:                 # 関節グループ別の強さ（クォータニオン成分に掛ける）
+      torso: {min_cutoff: 1.5, beta: 0.5}   # 骨盤・背骨
+      head:  {min_cutoff: 1.5, beta: 0.5}   # 首・頭
+      arm:   {min_cutoff: 2.5, beta: 1.0}   # 鎖骨・肩・肘
+      wrist: {min_cutoff: 2.0, beta: 0.5}   # 手首・手
+      leg:   {min_cutoff: 2.5, beta: 1.0}   # 股関節・膝・足首・足先
+  root_median_window: 5     # ルート移動量のスパイク除去（メディアンの窓幅、フレーム）
+
+# ---- 3. FK と接地点 ----
+body:
+  heel_toe_vertices: 4      # かかと・つま先それぞれに使う頂点数（その平均を接地点とする）
+  sole_band_m: 0.025        # 足の最下点からこの高さ以内の頂点を足裏の候補にする
+
+# ---- 4. 床面推定と定数オフセット ----
+floor:
+  low_speed_m_per_s: 0.2    # 水平速度がこれ未満のかかと・つま先を床の候補点にする
+  ransac_iterations: 300
+  ransac_inlier_m: 0.02
+  min_points: 30            # 候補点がこれ未満なら傾き補正をせず、低い点の高さだけで床を決める
+  align_tilt: true          # 床の法線が +Y になるよう全体を回転する
+  max_tilt_deg: 30.0        # これより大きい傾きは誤推定とみなして使わない
+  min_spread_m: 0.15        # 床の候補点の平面内の広がり（2 番目の主軸の標準偏差）がこれ未満なら傾きは補正しない
+  segment_mode: false       # 長尺で床が変わる場合: 区間ごとの定数オフセットにする
+  segment_sec: 10.0
+  segment_blend_sec: 1.0    # 区間の間のコサイン補間の長さ（1秒未満を指定しても1秒にする）
+  horizontal_origin: first_frame  # first_frame | mean | none（骨盤の水平位置の原点）
+  flip_facing: false        # Y軸周り180度回転（MMD で体の向きが逆になった場合）
+  seed: 0
+
+# ---- 5. MMD スケールへの変換 ----
+scale:
+  depth_scale: 1.0          # 奥行き（Z）方向の移動量だけに掛ける倍率
+
+# ---- 6. 接地判定 ----
+contact:
+  enter_height_m: 0.03      # 接地開始: 高さ < 3cm かつ 水平速度 < 0.25 m/s
+  enter_speed_m_per_s: 0.25
+  exit_height_m: 0.05       # 接地終了: 高さ >= 5cm または 水平速度 >= 0.4 m/s
+  exit_speed_m_per_s: 0.4
+  fill_gap_frames: 2        # この長さ以下の非接地の隙間は埋める
+  min_contact_frames: 4     # この長さ未満の接地区間は捨てる
+
+# ---- 7. 足ＩＫ ----
+foot_ik:
+  swing_one_euro: {min_cutoff: 2.0, beta: 1.0, d_cutoff: 1.0, zero_phase: true}  # 遊脚の平滑化 [m 単位]
+  blend_frames: 5           # 接地区間の端から遊脚側へ差分を減衰させるフレーム数
+  lock_rotation: true       # 接地中の足ＩＫの回転を区間内の平均で固定する
+  clamp_floor: true         # 最後に差分 Y < 0 を 0 にする
+  max_boundary_step_m: 0.05 # 境界でのフレーム間移動量の目安（診断・テスト用）
+
+# ---- 8. センターの安定化 ----
+center:
+  mode: A                   # A: 軸別平滑化 / B: 接地足からの逆算
+  axis_one_euro:            # モードA: 骨盤位置の軸別 One Euro [m 単位]。奥行き(Z)を最も強く
+    x: {min_cutoff: 1.5, beta: 0.5}
+    y: {min_cutoff: 1.5, beta: 0.5}
+    z: {min_cutoff: 0.5, beta: 0.3}
+  d_cutoff: 1.0
+  zero_phase: true
+  mode_b:
+    max_flight_sec: 0.6     # 両足が離れた区間がこれ以下なら上下を放物線で補間（超えたら姿勢由来の値へつなぐ）
+    gravity_m_per_s2: 9.8
+    final_one_euro: {min_cutoff: 3.0, beta: 0.5}  # 最後の軽い平滑化
+  reach_ratio: 0.98         # 股関節から足ＩＫまでの距離をこの割合×脚長以下にする
+  reach_min_window: 9       # 補正量カーブの移動最小値フィルタの窓幅
+  reach_gaussian_sigma: 2.0 # 続けて掛けるガウシアンの σ（フレーム）
+  reach_max_drop_m: 0.3     # 1 フレームで下げる量の上限（誤推定で極端に沈まないための保険）
+
+# ---- 10. VMD 書き出し ----
+vmd:
+  model_name: ''            # 空なら PMX のモデル名（PMX が無ければ nlf2vmd）
+  thin_keys: false          # キーの間引き（接地区間の開始・終了の足ＩＫキーは必ず残す）
+  thin_pos_tol_m: 0.003
+  thin_rot_tol_deg: 0.5
+
+# ---- 診断出力 ----
+diagnostics:
+  enabled: true
+  plots: true
