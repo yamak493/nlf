@@ -4,6 +4,7 @@
 だけで、ポーズ補正ブレンドシェイプは使わない（関節位置には影響しないため）。
 データは NLF の TorchScript に入っている SMPL から書き出せる（BodyModel.from_torch）。
 """
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +28,27 @@ FEET = LEG_JOINTS[:, 3]
 _KEYS = ('v_template', 'shapedirs', 'J_template', 'J_shapedirs', 'weights', 'parents')
 
 
+def sanitize_parents(parents, num_joints):
+    """親の番号を検証し、根（親なし）を -1 に揃える。
+
+    体モデルによっては根の親が -1 ではなく、-1 を符号なし 32 ビットで表した 4294967295
+    （float32 を経由すると 4294967296）で入っている。親は自分より前の関節でなければならないので、
+    それ以外の値はすべて「親なし」とみなす。根が 2 つ以上になる（木が壊れている）ときは、
+    SMPL の 24 関節なら既知の親子関係を使う。
+    """
+    p = np.asarray(parents).reshape(-1).astype(np.int64)
+    if len(p) != num_joints:
+        raise ValueError(f'親の数 {len(p)} が関節数 {num_joints} と一致しません')
+    p = np.where((p >= 0) & (p < np.arange(num_joints)), p, -1)
+    if (p[1:] < 0).any():
+        if num_joints == len(SMPL_PARENTS):
+            warnings.warn('体モデルの親子関係が不正なので、SMPL の既知の親子関係を使います',
+                          stacklevel=3)
+            return SMPL_PARENTS.copy()
+        raise ValueError(f'体モデルの親子関係が不正です: {parents}')
+    return p
+
+
 class BodyModel:
     def __init__(self, v_template, shapedirs, J_template, J_shapedirs, weights,
                  parents=SMPL_PARENTS):
@@ -35,11 +57,10 @@ class BodyModel:
         self.J_template = np.asarray(J_template, np.float64)       # (J, 3)
         self.J_shapedirs = np.asarray(J_shapedirs, np.float64)     # (J, 3, S)
         self.weights = np.asarray(weights, np.float64)             # (V, J)
-        self.parents = np.asarray(parents, np.int64)               # (J,)
         V, J = len(self.v_template), len(self.J_template)
+        self.parents = sanitize_parents(parents, J)                # (J,)
         assert self.weights.shape == (V, J), f'weights の形が不正です: {self.weights.shape}'
         assert self.shapedirs.shape[:2] == (V, 3) and self.J_shapedirs.shape[:2] == (J, 3)
-        assert len(self.parents) == J
 
     @property
     def num_betas(self):
@@ -80,7 +101,11 @@ class BodyModel:
     @classmethod
     def from_torch(cls, module, num_betas=10):
         """smplfitter / NLF TorchScript の体モデル（nn.Module）のバッファから作る。"""
-        bufs = {name: t.detach().float().cpu().numpy() for name, t in module.named_buffers()}
+        bufs = {}
+        for name, t in module.named_buffers():
+            # 整数のバッファ（親子関係）は float に変換しない（大きな値が丸められて壊れるため）
+            t = t.detach().cpu()
+            bufs[name] = (t.float() if t.is_floating_point() else t).numpy()
         v_template = bufs['v_template']
         shapedirs = bufs['shapedirs'][:, :, :num_betas]
         if 'J_template' in bufs and 'J_shapedirs' in bufs:
