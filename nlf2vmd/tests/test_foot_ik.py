@@ -1,5 +1,6 @@
 """足ＩＫ: 接地区間内の位置が完全に一定であること。境界でのフレーム間移動量が設定値を超えないこと。"""
 import numpy as np
+import pytest
 
 from nlf2vmd import load_config, quat
 from nlf2vmd.contact import ContactResult
@@ -58,3 +59,18 @@ def test_clamp_runs_after_lock_and_keeps_segment_constant():
     assert (seg == seg[0]).all() and seg[0, 1] == 0.0
     assert (ik.delta[..., 1] >= 0).all()
     assert ik.clamped_frames > 0
+
+
+@pytest.mark.parametrize('snap', [True, False])
+def test_snap_to_floor_puts_the_sole_on_the_floor(snap):
+    """接地中の足が推定のずれで 2cm 浮いていても、ロックの高さは足裏が床に着く高さになる。"""
+    cfg = load_config(overrides=[f'foot_ik.snap_to_floor={str(snap).lower()}']).foot_ik
+    T = 40
+    raw = np.zeros((T, 2, 3))
+    raw[..., 1] = 0.10 + 0.02                        # 足首（床に平らなら 0.10）ごと 2cm 浮いている
+    segs = [[(10, 29)], [(10, 29)]]
+    contact = _contact_from_segments(T, segs)
+    contact.heights[:] = 0.02                        # かかと・つま先の高さ
+    rot = np.tile(quat.IDENTITY, (T, 2, 1))
+    ik = build_foot_ik(raw, np.zeros((2, 3)), rot, contact, 30.0, 1.0, cfg)
+    np.testing.assert_allclose(ik.target[10:30, :, 1], 0.10 if snap else 0.12)

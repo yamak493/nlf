@@ -154,14 +154,62 @@ def add_depth_noise(motion, sigma=0.03, drift=0.08, seed=0):
     return dict(motion, trans=trans)
 
 
-def to_camera_coords(motion):
-    """Y 上向きの合成モーションを、NLF と同じカメラ座標（Y 下向き・Z 奥向き）に直す。"""
-    R = np.diag([1.0, -1.0, -1.0])
+def to_camera_coords(motion, height=0.0, pitch_deg=0.0, distance=4.0):
+    """Y 上向きの合成モーションを、NLF と同じカメラ座標（Y 下向き・Z 奥向き）に直す。
+
+    カメラは床からの高さ height [m]、原点から distance [m] 手前（+Z 側）に置き、-Z 方向（人物の正面）を
+    向いて pitch_deg だけ見下ろす。
+    """
+    th = np.deg2rad(pitch_deg)
+    pitch = np.array([[1.0, 0.0, 0.0], [0.0, np.cos(th), -np.sin(th)],
+                      [0.0, np.sin(th), np.cos(th)]])
+    R = pitch @ np.diag([1.0, -1.0, -1.0])
     out = dict(motion)
     q = quat.from_rotvec(np.asarray(motion['pose'], float))
     q[:, 0] = quat.mul(quat.from_matrix(R), q[:, 0])
     out['pose'] = quat.to_rotvec(q)
     pelvis = motion['trans'] + SMPL_REST_JOINTS[0]
-    out['trans'] = pelvis @ R.T - SMPL_REST_JOINTS[0] + np.array([0.0, 0.0, 4.0])
+    out['trans'] = (pelvis - [0.0, height, distance]) @ R.T - SMPL_REST_JOINTS[0]
     out['coord_system'] = 'camera'
     return out
+
+
+def add_ray_drift(motion, drift=0.3, sigma=0.03, seed=0):
+    """カメラ座標のモーションの骨盤を、カメラの中心からの視線に沿ってずらす（単眼推定の距離のずれ）。
+
+    drift [m]: ゆっくりしたずれ（1 秒程度で変わる低周波のノイズ）の標準偏差 / sigma [m]: 毎フレームの
+    白色ノイズの標準偏差。カメラが骨盤より高い位置にあると、視線が斜め下を向いているので上下にもずれる。
+    """
+    from scipy.ndimage import gaussian_filter1d
+    rng = np.random.default_rng(seed)
+    pelvis = np.asarray(motion['trans'], np.float64) + SMPL_REST_JOINTS[0]
+    T = len(pelvis)
+    w = gaussian_filter1d(rng.normal(0.0, 1.0, T + 400), 30.0)[200:200 + T]
+    d = drift * w / w.std() + rng.normal(0.0, sigma, T)
+    scale = 1.0 + d / np.linalg.norm(pelvis, axis=1)
+    return dict(motion, trans=pelvis * scale[:, None] - SMPL_REST_JOINTS[0])
+
+
+def add_jump(motion, start_sec, duration_sec, height):
+    """Y 上向きの合成モーションの体全体を、start_sec から duration_sec のあいだ放物線で持ち上げる。"""
+    trans = np.array(motion['trans'], np.float64, copy=True)
+    fps = float(motion['fps'])
+    s = (np.arange(len(trans)) / fps - start_sec) / duration_sec
+    inside = (s > 0) & (s < 1)
+    trans[inside, 1] += 4.0 * height * s[inside] * (1.0 - s[inside])
+    return dict(motion, trans=trans, airborne=inside)
+
+
+def add_joint_noise(motion, degrees, smooth_frames=3.0, seed=0):
+    """関節の回転に、数フレームかけて変わる揺れを足す（単眼推定の姿勢の揺れ）。
+
+    degrees: {関節番号: 揺れの標準偏差 [度]}。例えば足首・足先の向きが揺れると、かかと・つま先が上下する。
+    """
+    from scipy.ndimage import gaussian_filter1d
+    rng = np.random.default_rng(seed)
+    q = quat.from_rotvec(np.asarray(motion['pose'], float))
+    T = len(q)
+    for j, deg in degrees.items():
+        w = gaussian_filter1d(rng.normal(0.0, 1.0, (T, 3)), smooth_frames, axis=0)
+        q[:, j] = quat.mul(q[:, j], quat.from_rotvec(np.deg2rad(deg) * w / w.std()))
+    return dict(motion, pose=quat.to_rotvec(q))

@@ -15,7 +15,9 @@ from .config import Config, load_config
 from .contact import detect_contacts
 from .depth import depth_axis, depth_jitter, detection_speeds, reconstruct_depth
 from .floor import estimate_floor
+from .filters import runs
 from .foot_ik import boundary_steps, build_foot_ik
+from .ground import floating_frames, ground_offset
 from .jitter import stabilize_pose, stabilize_root
 from .motion_io import load_motion
 from .pmx import PmxModel, read_pmx
@@ -52,6 +54,7 @@ class ConversionResult:
     diagnostics_path: str = ''
     plot_paths: dict = field(default_factory=dict)
     depth: object = None
+    ground: object = None
 
 
 def resolve_skeleton(pmx):
@@ -183,11 +186,13 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     kin_raw = compute_kinematics(motion.quats, motion.root_pos, rest)   # 診断の「処理前」用
 
     # ---- 4. 床面推定と定数オフセット ----
-    floor = estimate_floor(kin, fps, cfg.floor)
+    floor = estimate_floor(kin, fps, cfg.floor, rest.points.mean(2))
     kin, kin_raw = floor.apply(kin), floor.apply(kin_raw)
     log(f'[4] 床: 傾き {floor.tilt_deg:.1f} 度（'
-        + ('補正済み' if floor.tilt_applied else '補正なし') + f'）/ 候補点 {floor.num_points}'
-        f'（インライア {floor.num_inliers}・広がり {floor.spread:.2f} m）'
+        + {'full': '補正済み', 'line': '1 方向だけ補正', 'none': '補正なし'}[floor.tilt_mode]
+        + f'）/ 候補点 {floor.num_points}'
+        f'（{"ベクトル" if cfg.floor.tilt_method == "vectors" else "インライア"} '
+        f'{floor.num_inliers}・広がり {floor.spread:.2f} m）'
         + ('（候補点が少ないため高さだけ推定）' if floor.fallback else ''))
 
     # ---- 5. MMD スケールへ ----
@@ -200,18 +205,27 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     log(f'[5] スケール係数 {k:.3f}（MMD 脚長 {skel.mean_leg_length():.2f} / SMPL 脚長 '
         f'{smpl_leg:.3f} m）')
 
+    # ---- 6a. 接地の拘束（両足が長く浮いた・埋まった状態を、体全体の上下の平行移動で床に戻す） ----
     # ---- 6. 接地判定（速度は奥行きのぶれを除いて求める） ----
     # ---- 6b. 奥行きの再構成（接地している足から骨盤の奥行きを求め直す） ----
     # 2 回目以降は、奥行きを補正した体でもう一度接地を判定する（両足が同時に前後へ動いて見えて
-    # 判定から漏れたフレームを拾い、その区間も含めて奥行きを求め直す）
+    # 判定から漏れたフレームを拾い、その区間も含めて奥行きを求め直す）。奥行きの軸は床の傾きを補正すると
+    # 上下の成分を持つので、接地の拘束は奥行きを補正した体に毎回掛け直す
     axis = depth_axis(floor.rotation)
-    judged = kin
+    ground = ground_offset(kin, fps, k, cfg.ground)
+    judged = ground.apply(kin)
     for _ in range(max(1, int(cfg.depth.passes)) if cfg.depth.reconstruct else 1):
         contact = detect_contacts(judged.contact_points, fps, cfg.contact, unit=k,
                                   speeds=detection_speeds(judged, axis, fps, k, cfg.depth))
         depth = reconstruct_depth(kin, kin_raw, contact, axis, fps, k, cfg.depth)
-        judged = depth.apply(kin)
+        moved = depth.apply(kin)
+        ground = ground_offset(moved, fps, k, cfg.ground)
+        judged = ground.apply(moved)
     kin = judged
+    if ground.enabled:
+        log(f'[6a] 接地の拘束: 上下の補正 {-ground.offset.max() / k * 100:.1f} 〜 '
+            f'{-ground.offset.min() / k * 100:.1f} cm / ジャンプとして残した区間 '
+            f'{len(runs(ground.flight))}')
     log(f'[6] 接地区間: 左 {len(contact.segments[0])} / 右 {len(contact.segments[1])}')
     if depth.enabled:
         log(f'[6b] 奥行きの補正: 最大 {np.abs(depth.correction).max() / k * 100:.1f} cm')
@@ -252,13 +266,14 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     result = ConversionResult(
         str(out_path), n_keys, cfg, fps, k, motion, quats, kin, kin_raw, floor, contact, ik,
         center, ankle_rest, geom, rt.global_matrix('下半身', kin_raw.glob_rot), local, tracks,
-        warnings=warns, depth=depth)
+        warnings=warns, depth=depth, ground=ground)
     result.info = dict(
         frames=motion.num_frames, fps=fps, source_fps=motion.source_fps, scale=k,
         smpl_leg_length_m=smpl_leg, mmd_leg_length=skel.mean_leg_length(),
         skeleton=skel.source, model_name=model_name, bones=[t.name for t in tracks],
         fk_check_mm=motion.fk_check_mm, jitter=jitter_info,
         floor=dict(tilt_deg=floor.tilt_deg, tilt_applied=floor.tilt_applied,
+                   tilt_mode=floor.tilt_mode,
                    normal=floor.normal.tolist(), points=floor.num_points,
                    inliers=floor.num_inliers, spread_m=floor.spread, fallback=floor.fallback,
                    segment_heights=floor.segment_heights),
@@ -274,6 +289,14 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
                                            (depth_jitter(kin_raw.root_pos, axis) / k * 100.0)
                                            .tolist())),
                    max_correction_cm=float(np.abs(depth.correction).max() / k * 100.0)),
+        ground=dict(enabled=ground.enabled, window_frames=ground.window,
+                    correction_cm=dict(min=float(-ground.offset.max() / k * 100.0),
+                                       max=float(-ground.offset.min() / k * 100.0)),
+                    floating_frames_before=floating_frames(
+                        ground.lowest, fps, float(cfg.contact.exit_height_m) * k,
+                        cfg.ground.max_flight_sec),
+                    jumps_sec=[[round(s0 / fps, 2), round((e0 + 1) / fps, 2)]
+                               for s0, e0 in runs(ground.flight)]),
         warnings=warns)
 
     if cfg.diagnostics.enabled:

@@ -5,11 +5,16 @@ from pathlib import Path
 import numpy as np
 
 from .body_model import ANKLES
+from .ground import floating_frames, lowest_foot_height
 from .jitter import JOINT_GROUPS, angular_acceleration
 
 METRIC_LABELS = {
     'foot_slide_cm_per_frame': ('足滑り', '接地区間内の足ＩＫの水平移動量の平均', '0'),
     'penetration_frames': ('埋まり', '足ＩＫの差分Yが0未満のフレーム数（足ごと）', '0'),
+    'floating_frames': ('浮き', '両足の最下点が接地終了の高さより上にいる状態が、ジャンプの最長滞空時間'
+                        '（ground.max_flight_sec）より長く続くフレーム数', '0'),
+    'hover_frames': ('短い浮き', '両足とも接地区間の外で、ジャンプとして残した区間でもないのに、出力の両足の足裏が'
+                     '床から 2cm より上にあるフレーム数', '0 に近い'),
     'center_jitter_cm_per_frame2': ('センターの震え', 'センター・グルーブ位置の加速度の絶対値の平均（X, Y, Z）',
                                     '処理前より大幅に減少'),
     'pose_jitter_deg_per_s2': ('姿勢の震え', '関節の角加速度の平均（グループ別）', '処理前より減少'),
@@ -60,6 +65,27 @@ def foot_motion_near_floor(pos, heights, limit, unit):
     return (d[:, [0, 2]].mean(0) / unit * 100.0).tolist()
 
 
+def output_sole_heights(r):
+    """(T, 2) 出力の足ＩＫでの足裏の高さ（足首の高さ − その姿勢での足首から足裏の最下点までの高さ）。
+
+    接地区間は、足ＩＫの回転を区間内の平均で固定しているので、足首から足裏までの高さも区間内の中央値を使う。
+    """
+    ankle_above_sole = r.kin.joints[:, ANKLES, 1] - r.kin.contact_points[..., 1].min(-1)
+    sole = r.foot_ik.target[..., 1] - ankle_above_sole
+    for foot in range(2):
+        for s, e in r.contact.segments[foot]:
+            sole[s:e + 1, foot] = r.foot_ik.target[s, foot, 1] - np.median(
+                ankle_above_sole[s:e + 1, foot])
+    return sole
+
+
+def hover_mask(r, height):
+    """(T,) 両足とも接地区間の外で、ジャンプとして残した区間でもないのに、出力の両足の足裏が height より上のフレーム。"""
+    flight = r.ground.flight if r.ground is not None else np.zeros(len(r.kin.joints), bool)
+    return (~r.contact.flags.any(1) & ~flight
+            & (output_sole_heights(r).min(1) > height))
+
+
 def accel_per_axis(p, unit):
     """位置 (T, 3) の加速度の絶対値の平均 [cm/フレーム^2]（軸別）。"""
     if len(p) < 3:
@@ -81,6 +107,7 @@ def compute_metrics(r):
     処理前の値は、ジッター制御も奥行きの再構成もしていない入力（kin_raw）から求める。
     """
     k, seg = r.scale, r.contact.segments
+    float_h = r.config.contact.exit_height_m * k
     raw_ankles = r.kin_raw.joints[:, ANKLES]
     raw_ik_delta = raw_ankles - r.ankle_rest[None]
     m = {
@@ -88,6 +115,11 @@ def compute_metrics(r):
                                         after=foot_slide(r.foot_ik.target, seg, k)),
         'penetration_frames': dict(before=(raw_ik_delta[..., 1] < 0).sum(0).tolist(),
                                    after=(r.foot_ik.delta[..., 1] < 0).sum(0).tolist()),
+        'floating_frames': dict(before=floating_frames(lowest_foot_height(r.kin_raw), r.fps, float_h,
+                                                       r.config.ground.max_flight_sec),
+                                after=floating_frames(lowest_foot_height(r.kin), r.fps, float_h,
+                                                      r.config.ground.max_flight_sec)),
+        'hover_frames': dict(after=int(hover_mask(r, 0.02 * k).sum())),
         'center_jitter_cm_per_frame2': dict(before=accel_per_axis(r.center.raw, k),
                                             after=accel_per_axis(r.center.delta, k)),
         'pose_jitter_deg_per_s2': dict(before=pose_jitter(r.motion.quats, r.fps),
@@ -125,7 +157,8 @@ def format_metrics(metrics):
 
     units = {'foot_slide_cm_per_frame': ' cm/フレーム', 'center_jitter_cm_per_frame2':
              ' cm/フレーム²（X, Y, Z）', 'pose_jitter_deg_per_s2': ' deg/s²',
-             'foot_motion_near_floor_cm_per_frame': ' cm/フレーム（X, Z）'}
+             'foot_motion_near_floor_cm_per_frame': ' cm/フレーム（X, Z）',
+             'floating_frames': ' フレーム', 'hover_frames': ' フレーム'}
     lines = []
     for key, m in metrics.items():
         before = fmt(m['before']) if 'before' in m else '-'
@@ -213,6 +246,30 @@ def save_plots(r, out_dir):
         fig.tight_layout()
         paths['depth'] = out_dir / 'depth.png'
         fig.savefig(paths['depth'], dpi=110)
+
+    # 2c. 接地の拘束（両足の最下点と、体全体の上下の補正量）
+    if r.ground is not None:
+        fig = Figure(figsize=(12, 4))
+        ax = fig.subplots()
+        _bands(ax, r.contact.flags.any(1), 'tab:green', alpha=0.12)
+        _bands(ax, r.ground.flight, 'tab:orange', alpha=0.35)
+        _bands(ax, hover_mask(r, 0.02 * k), 'tab:red', alpha=0.35)
+        ax.plot(frames, r.ground.lowest * cm, color='0.6', lw=1,
+                label='lowest foot point: before (smoothed pose)')
+        ax.plot(frames, lowest_foot_height(r.kin) * cm, color='tab:red', lw=1.2,
+                label='lowest foot point: after')
+        if r.ground.enabled:
+            ax.plot(frames, -r.ground.offset * cm, color='tab:purple', lw=1, ls='--',
+                    label='vertical correction')
+        ax.axhline(cfg.contact.exit_height_m * 100, color='tab:blue', ls='--', lw=0.8)
+        ax.set_title('grounding: green = a foot is in contact, orange = kept as a jump, '
+                     'red = both feet above 2 cm without contact (not a jump)', fontsize=10)
+        ax.set_ylabel('height [cm]')
+        ax.set_xlabel('frame')
+        ax.legend(loc='upper right', fontsize=8)
+        fig.tight_layout()
+        paths['ground'] = out_dir / 'ground.png'
+        fig.savefig(paths['ground'], dpi=110)
 
     # 3. 届く高さへのクランプの補正量
     fig = Figure(figsize=(12, 3.5))

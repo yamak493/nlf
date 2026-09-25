@@ -51,9 +51,14 @@ def build_foot_ik(ankle_pos, ankle_rest, rot_quats, contact, fps, unit, cfg):
         q = quat.make_continuous(rot[:, foot])
         q_out = q.copy()
         foot_locks = []
-        # 接地区間のロック: 位置は区間内の中央値、回転は区間内の平均
+        # 接地区間のロック: 位置は区間内の中央値、回転は区間内の平均。
+        # snap_to_floor なら、上下は「足首の高さ − その足の最下点の高さ」（足裏を床に着けたときの足首の高さ）
+        # の中央値にする（推定のずれで接地中の足が床から浮いていても、足裏が床に着く）
+        sole = np.asarray(contact.heights)[:, foot].min(-1)
         for s, e in segs:
             lock = np.median(raw[s:e + 1, foot], axis=0)
+            if cfg.snap_to_floor:
+                lock[1] = np.median(raw[s:e + 1, foot, 1] - sole[s:e + 1])
             out[s:e + 1] = lock
             foot_locks.append((s, e, lock))
             if cfg.lock_rotation:

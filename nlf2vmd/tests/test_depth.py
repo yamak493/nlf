@@ -61,9 +61,11 @@ def test_noise_free_walk_is_unchanged_by_depth_handling(run_walk, speed):
 
 
 def test_reconstruction_only_translates_along_the_depth_axis(tmp_path, body_model):
-    """奥行きの補正は体全体の平行移動で、姿勢（骨盤からの相対位置）は変えない。"""
-    _, r = _convert_noisy(tmp_path, body_model)
-    _, r0 = _convert_noisy(tmp_path, body_model, ['depth.reconstruct=false'], 'off.vmd')
+    """奥行きの補正は体全体の平行移動で、姿勢（骨盤からの相対位置）は変えない。
+    （接地の拘束は奥行きを補正した体に掛け直すので、ここでは切って奥行きの補正だけを比べる）"""
+    _, r = _convert_noisy(tmp_path, body_model, ['ground.enabled=false'])
+    _, r0 = _convert_noisy(tmp_path, body_model, ['depth.reconstruct=false', 'ground.enabled=false'],
+                           'off.vmd')
     shift = r.kin.joints - r0.kin.joints                          # (T, J, 3)
     expected = r.depth.correction[:, None, None] * r.depth.axis
     np.testing.assert_allclose(shift, np.broadcast_to(expected, shift.shape), atol=1e-9)
