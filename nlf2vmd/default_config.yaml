@@ -86,6 +86,16 @@ center:
   reach_gaussian_sigma: 2.0 # 続けて掛けるガウシアンの σ（フレーム）
   reach_max_drop_m: 0.3     # 1 フレームで下げる量の上限（誤推定で極端に沈まないための保険）
 
+# ---- 9. 上半身の回転リターゲット ----
+# 補正回転は、SMPL（T ポーズ）と MMD モデル（A ポーズ）の初期姿勢が本当に違う部分（腕）だけに掛ける。
+# joints / direction にすると、関節の位置を結んだ向きを合わせる方法（vmd.md の記述どおり）になるが、
+# SMPL と PMX で関節の置き方が違う所では姿勢がずれる。
+retarget:
+  torso_up: vertical        # 体幹・首・頭: vertical（どちらも直立とみなし、左右のねじれだけ合わせる）| joints（首が前に倒れて顎が出やすい）
+  collar: identity          # 肩: identity（補正しない）| direction（肩→腕の向きを合わせる。肩がすくみやすい）
+  wrist: forearm            # 手首: forearm（前腕と同じ補正 = 手首はまっすぐ）| direction（手の関節への向きを合わせる）
+  foot: yaw                 # 足ＩＫ: yaw（つま先の左右の向きだけ合わせる）| direction（足首→つま先の向きを合わせる。足裏が傾きやすい）
+
 # ---- 10. VMD 書き出し ----
 vmd:
   model_name: ''            # 空なら PMX のモデル名（PMX が無ければ nlf2vmd）

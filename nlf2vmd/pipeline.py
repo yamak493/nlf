@@ -152,6 +152,10 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     for name, note in (('上半身2', '上半身に合成します'), ('グルーブ', '上下移動はセンターの Y に書きます')):
         if not skel.has(name):
             warn(f'{name} が無いモデルです（{note}）')
+    for s in SIDES:
+        # 足ＩＫの回転は、子の つま先ＩＫ を動かすことで足首の向きになる
+        if skel.source == 'pmx' and not skel.has(s + 'つま先ＩＫ'):
+            warn(f'{s}つま先ＩＫ が無いモデルです（足ＩＫの回転が足首に伝わらず、足先の向きが変わりません）')
     bm = resolve_body_model(body_model, source)
 
     # ---- 1. 読み込み・正規化 ----
@@ -199,7 +203,8 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     log(f'[6] 接地区間: 左 {len(contact.segments[0])} / 右 {len(contact.segments[1])}')
 
     # ---- 7. 足ＩＫ ----
-    rt = Retargeter(skel, rest.joints)
+    foot_axes = rest.points[:, 1].mean(1) - rest.points[:, 0].mean(1)   # かかと → つま先
+    rt = Retargeter(skel, rest.joints, foot_axes, cfg.retarget)
     for w in rt.warnings:
         warn(w)
     ik = build_foot_ik(kin.joints[:, ANKLES], ankle_rest, rt.foot_ik_quats(kin.glob_rot),
