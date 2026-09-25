@@ -64,11 +64,12 @@ def _stance_frames(num_frames, fps, step_sec):
 
 
 def synthetic_walk(num_frames=180, fps=30.0, speed=1.0, heading_deg=0.0, step_sec=0.6,
-                   lift=0.08, noise_deg=0.0, seed=0):
+                   lift=0.08, noise_deg=0.0, seed=0, sway=0.0, sway_hz=1.5):
     """heading_deg の向きに一定速度で歩く（体もその向きを向く）合成モーション。Y 上向き座標。
 
     支持脚の足首は床に固定し（倒立振子のように骨盤が上下する）、遊脚は足首の軌道を
     2 リンクの IK で解く。足は常に床と平行。heading_deg=0 で +Z（SMPL の正面）に進む。
+    sway [m] を指定すると、骨盤が進行方向に sway_hz で前後に揺れる（足は床に着いたまま）。
     戻り値は load_motion に渡せる dict（'stance' に正解の接地フラグ (T, 2) を入れる）。
     """
     rng = np.random.default_rng(seed)
@@ -79,7 +80,7 @@ def synthetic_walk(num_frames=180, fps=30.0, speed=1.0, heading_deg=0.0, step_se
     s = t / step_sec - k
     P, v = step_sec, speed
     hip_off = J[[1, 2]] - J[0]
-    pelvis_z = v * t
+    pelvis_z = v * t + sway * np.sin(2 * np.pi * sway_hz * t)
 
     # 各足の足首の目標（体のローカル座標: z = 前, y = 上）
     foot = np.zeros((num_frames, 2, 2))
@@ -133,6 +134,24 @@ def synthetic_walk(num_frames=180, fps=30.0, speed=1.0, heading_deg=0.0, step_se
     pelvis = np.stack([np.zeros(num_frames), pelvis_y, pelvis_z], axis=1) @ R.T
     return dict(pose=quat.to_rotvec(q), betas=np.zeros(10), trans=pelvis - J[0], fps=fps,
                 coord_system='yup', stance=stance)
+
+
+def add_depth_noise(motion, sigma=0.03, drift=0.08, seed=0):
+    """カメラ座標のモーションの trans の奥行き（Z）に、単眼推定のようなぶれを足す。
+
+    sigma [m]: 毎フレームの白色ノイズの標準偏差 / drift [m]: ゆっくりしたずれ（0.5 秒程度で
+    変わる低周波のノイズ）の標準偏差。
+    """
+    from scipy.ndimage import gaussian_filter1d
+    rng = np.random.default_rng(seed)
+    trans = np.array(motion['trans'], np.float64, copy=True)
+    T = len(trans)
+    z = rng.normal(0.0, sigma, T)
+    if drift > 0:
+        w = gaussian_filter1d(rng.normal(0.0, 1.0, T + 200), 15.0)[100:100 + T]
+        z += drift * w / w.std()
+    trans[:, 2] += z
+    return dict(motion, trans=trans)
 
 
 def to_camera_coords(motion):

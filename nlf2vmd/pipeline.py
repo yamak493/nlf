@@ -13,6 +13,7 @@ from .body_model import ANKLES, BodyModel, compute_kinematics, rest_info
 from .center import ReachGeometry, stabilize_center
 from .config import Config, load_config
 from .contact import detect_contacts
+from .depth import depth_axis, depth_jitter, detection_speeds, reconstruct_depth
 from .floor import estimate_floor
 from .foot_ik import boundary_steps, build_foot_ik
 from .jitter import stabilize_pose, stabilize_root
@@ -50,6 +51,7 @@ class ConversionResult:
     warnings: list = field(default_factory=list)
     diagnostics_path: str = ''
     plot_paths: dict = field(default_factory=dict)
+    depth: object = None
 
 
 def resolve_skeleton(pmx):
@@ -198,9 +200,21 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     log(f'[5] スケール係数 {k:.3f}（MMD 脚長 {skel.mean_leg_length():.2f} / SMPL 脚長 '
         f'{smpl_leg:.3f} m）')
 
-    # ---- 6. 接地判定 ----
-    contact = detect_contacts(kin.contact_points, fps, cfg.contact, unit=k)
+    # ---- 6. 接地判定（速度は奥行きのぶれを除いて求める） ----
+    # ---- 6b. 奥行きの再構成（接地している足から骨盤の奥行きを求め直す） ----
+    # 2 回目以降は、奥行きを補正した体でもう一度接地を判定する（両足が同時に前後へ動いて見えて
+    # 判定から漏れたフレームを拾い、その区間も含めて奥行きを求め直す）
+    axis = depth_axis(floor.rotation)
+    judged = kin
+    for _ in range(max(1, int(cfg.depth.passes)) if cfg.depth.reconstruct else 1):
+        contact = detect_contacts(judged.contact_points, fps, cfg.contact, unit=k,
+                                  speeds=detection_speeds(judged, axis, fps, k, cfg.depth))
+        depth = reconstruct_depth(kin, kin_raw, contact, axis, fps, k, cfg.depth)
+        judged = depth.apply(kin)
+    kin = judged
     log(f'[6] 接地区間: 左 {len(contact.segments[0])} / 右 {len(contact.segments[1])}')
+    if depth.enabled:
+        log(f'[6b] 奥行きの補正: 最大 {np.abs(depth.correction).max() / k * 100:.1f} cm')
 
     # ---- 7. 足ＩＫ ----
     foot_axes = rest.points[:, 1].mean(1) - rest.points[:, 0].mean(1)   # かかと → つま先
@@ -238,7 +252,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     result = ConversionResult(
         str(out_path), n_keys, cfg, fps, k, motion, quats, kin, kin_raw, floor, contact, ik,
         center, ankle_rest, geom, rt.global_matrix('下半身', kin_raw.glob_rot), local, tracks,
-        warnings=warns)
+        warnings=warns, depth=depth)
     result.info = dict(
         frames=motion.num_frames, fps=fps, source_fps=motion.source_fps, scale=k,
         smpl_leg_length_m=smpl_leg, mmd_leg_length=skel.mean_leg_length(),
@@ -255,6 +269,11 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
                     exceed_after=center.exceed_after,
                     max_drop_cm=float(-center.correction.min() / k * 100.0)),
         contact_segments=dict(left=contact.segments[0], right=contact.segments[1]),
+        depth=dict(reconstructed=depth.enabled, axis=axis.tolist(),
+                   root_jitter_cm=dict(zip(('depth', 'lateral'),
+                                           (depth_jitter(kin_raw.root_pos, axis) / k * 100.0)
+                                           .tolist())),
+                   max_correction_cm=float(np.abs(depth.correction).max() / k * 100.0)),
         warnings=warns)
 
     if cfg.diagnostics.enabled:

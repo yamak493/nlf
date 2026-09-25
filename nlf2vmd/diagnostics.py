@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .body_model import ANKLES
 from .jitter import JOINT_GROUPS, angular_acceleration
 
 METRIC_LABELS = {
@@ -14,6 +15,9 @@ METRIC_LABELS = {
     'pose_jitter_deg_per_s2': ('姿勢の震え', '関節の角加速度の平均（グループ別）', '処理前より減少'),
     'overextended_frames': ('脚の伸び切り', '股関節から足ＩＫまでの距離が脚長の98%を超えるフレーム数', '0'),
     'contact_segments': ('接地切り替え回数', '足ごとの接地区間の数', '目視との整合を確認'),
+    'foot_motion_near_floor_cm_per_frame': (
+        '床付近の足の動き', '足が床付近（かかとかつま先が接地終了の高さ未満）にあるときの足ＩＫの移動量の平均（X, Z）',
+        'Z（奥行き）が X と同程度まで減少'),
 }
 
 
@@ -42,6 +46,20 @@ def foot_slide(pos, segments, unit):
     return float(np.concatenate(steps).mean() / unit * 100.0)
 
 
+def foot_motion_near_floor(pos, heights, limit, unit):
+    """足が床付近にある（前後のフレームとも高さ < limit）ときの移動量の平均 [cm/フレーム]（X, Z 別）。
+
+    接地区間の外（判定から漏れたフレーム）の滑りも含めて、軸ごとに比べるための指標。
+    pos: (T, 2, 3) / heights: (T, 2, 2 [かかと, つま先])。
+    """
+    near = np.asarray(heights).min(-1) < limit
+    both = near[:-1] & near[1:]
+    if not both.any():
+        return [0.0, 0.0]
+    d = np.abs(np.diff(pos, axis=0))[both]
+    return (d[:, [0, 2]].mean(0) / unit * 100.0).tolist()
+
+
 def accel_per_axis(p, unit):
     """位置 (T, 3) の加速度の絶対値の平均 [cm/フレーム^2]（軸別）。"""
     if len(p) < 3:
@@ -58,11 +76,15 @@ def pose_jitter(quats, fps):
 
 
 def compute_metrics(r):
-    """r: pipeline.ConversionResult。処理前・処理後を並べた辞書を返す。"""
+    """r: pipeline.ConversionResult。処理前・処理後を並べた辞書を返す。
+
+    処理前の値は、ジッター制御も奥行きの再構成もしていない入力（kin_raw）から求める。
+    """
     k, seg = r.scale, r.contact.segments
-    raw_ik_delta = r.foot_ik.raw - r.ankle_rest[None]
+    raw_ankles = r.kin_raw.joints[:, ANKLES]
+    raw_ik_delta = raw_ankles - r.ankle_rest[None]
     m = {
-        'foot_slide_cm_per_frame': dict(before=foot_slide(r.foot_ik.raw, seg, k),
+        'foot_slide_cm_per_frame': dict(before=foot_slide(raw_ankles, seg, k),
                                         after=foot_slide(r.foot_ik.target, seg, k)),
         'penetration_frames': dict(before=(raw_ik_delta[..., 1] < 0).sum(0).tolist(),
                                    after=(r.foot_ik.delta[..., 1] < 0).sum(0).tolist()),
@@ -77,6 +99,11 @@ def compute_metrics(r):
             before_clamp=r.center.exceed_before,
             after=r.center.exceed_after),
         'contact_segments': dict(after=[len(s) for s in seg]),
+        'foot_motion_near_floor_cm_per_frame': dict(
+            before=foot_motion_near_floor(raw_ankles, r.contact.heights,
+                                          r.config.contact.exit_height_m * k, k),
+            after=foot_motion_near_floor(r.foot_ik.target, r.contact.heights,
+                                         r.config.contact.exit_height_m * k, k)),
     }
     for key, (label, definition, goal) in METRIC_LABELS.items():
         m[key].update(label=label, definition=definition, goal=goal)
@@ -97,7 +124,8 @@ def format_metrics(metrics):
         return str(v)
 
     units = {'foot_slide_cm_per_frame': ' cm/フレーム', 'center_jitter_cm_per_frame2':
-             ' cm/フレーム²（X, Y, Z）', 'pose_jitter_deg_per_s2': ' deg/s²'}
+             ' cm/フレーム²（X, Y, Z）', 'pose_jitter_deg_per_s2': ' deg/s²',
+             'foot_motion_near_floor_cm_per_frame': ' cm/フレーム（X, Z）'}
     lines = []
     for key, m in metrics.items():
         before = fmt(m['before']) if 'before' in m else '-'
@@ -165,6 +193,27 @@ def save_plots(r, out_dir):
     paths['center'] = out_dir / 'center.png'
     fig.savefig(paths['center'], dpi=110)
 
+    # 2b. 骨盤の奥行きの再構成（接地している足から求め直した奥行き）
+    if r.depth is not None:
+        fig = Figure(figsize=(12, 4))
+        ax = fig.subplots()
+        _bands(ax, r.contact.flags.any(1), 'tab:green', alpha=0.12)
+        ax.plot(frames, (r.depth.raw - r.depth.raw[0]) * cm, color='0.6', lw=1,
+                label='before (estimated depth)')
+        if r.depth.enabled:
+            ax.plot(frames, (r.depth.depth - r.depth.raw[0]) * cm, color='tab:red', lw=1.2,
+                    label='after (from planted feet)')
+        jit = r.info.get('depth', {}).get('root_jitter_cm', {})
+        ax.set_title('pelvis depth along the camera axis; green = a foot is in contact '
+                     f"(jitter: depth {jit.get('depth', 0):.1f} cm / lateral "
+                     f"{jit.get('lateral', 0):.1f} cm)")
+        ax.set_ylabel('depth [cm]')
+        ax.set_xlabel('frame')
+        ax.legend(loc='upper right', fontsize=8)
+        fig.tight_layout()
+        paths['depth'] = out_dir / 'depth.png'
+        fig.savefig(paths['depth'], dpi=110)
+
     # 3. 届く高さへのクランプの補正量
     fig = Figure(figsize=(12, 3.5))
     ax = fig.subplots()
@@ -184,7 +233,7 @@ def save_plots(r, out_dir):
     fig = Figure(figsize=(12, 6))
     axes = fig.subplots(1, 2)
     for foot, ax in enumerate(axes):
-        raw = r.foot_ik.raw[:, foot] * cm
+        raw = r.kin_raw.joints[:, ANKLES[foot]] * cm
         tgt = r.foot_ik.target[:, foot] * cm
         ax.plot(raw[:, 0], raw[:, 2], color='0.75', lw=0.8, label='before')
         ax.plot(tgt[:, 0], tgt[:, 2], color='tab:blue', lw=1, label='after')

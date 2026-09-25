@@ -36,15 +36,16 @@ def clean_flags(flags, fill_gap, min_len):
     return flags
 
 
-def detect_contacts(points, fps, cfg, unit=1.0):
+def detect_contacts(points, fps, cfg, unit=1.0, speeds=None):
     """points: (T, 2 足, P 点, 3)。床が y=0 の座標。しきい値 [m] には unit を掛けて使う。
 
     かかとまたはつま先のどちらかが「高さ < しきい値」かつ「水平速度 < しきい値」なら接地。
     接地の開始より終了の条件を緩くして、境目でのバタつきを防ぐ。
+    speeds: (T, 2, P) の水平速度（奥行きのぶれを除いたもの）。None なら points から求める。
     """
     points = np.asarray(points, np.float64)
     heights = points[..., 1]
-    speeds = horizontal_speed(points, fps)
+    speeds = horizontal_speed(points, fps) if speeds is None else np.asarray(speeds, np.float64)
     enter = ((heights < cfg.enter_height_m * unit)
              & (speeds < cfg.enter_speed_m_per_s * unit)).any(-1)
     stay = ((heights < cfg.exit_height_m * unit)
