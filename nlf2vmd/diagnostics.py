@@ -23,6 +23,8 @@ METRIC_LABELS = {
     'foot_motion_near_floor_cm_per_frame': (
         '床付近の足の動き', '足が床付近（かかとかつま先が接地終了の高さ未満）にあるときの足ＩＫの移動量の平均（X, Z）',
         'Z（奥行き）が X と同程度まで減少'),
+    'lean_deg': ('前後の傾き', '接地している足の支持点の中心から全身の重心への線の、カメラの奥行き方向の傾きの中央値'
+                 '（度。+ はカメラへ近づく向き。処理前はステージ6cの補正前の姿勢）', '0 に近い'),
 }
 
 
@@ -137,8 +139,12 @@ def compute_metrics(r):
             after=foot_motion_near_floor(r.foot_ik.target, r.contact.heights,
                                          r.config.contact.exit_height_m * k, k)),
     }
+    if r.lean is not None and r.lean.enabled:
+        m['lean_deg'] = dict(before=float(np.nanmedian(r.lean.before_deg)),
+                             after=float(np.nanmedian(r.lean.after_deg)))
     for key, (label, definition, goal) in METRIC_LABELS.items():
-        m[key].update(label=label, definition=definition, goal=goal)
+        if key in m:
+            m[key].update(label=label, definition=definition, goal=goal)
     return m
 
 
@@ -158,7 +164,7 @@ def format_metrics(metrics):
     units = {'foot_slide_cm_per_frame': ' cm/フレーム', 'center_jitter_cm_per_frame2':
              ' cm/フレーム²（X, Y, Z）', 'pose_jitter_deg_per_s2': ' deg/s²',
              'foot_motion_near_floor_cm_per_frame': ' cm/フレーム（X, Z）',
-             'floating_frames': ' フレーム', 'hover_frames': ' フレーム'}
+             'floating_frames': ' フレーム', 'hover_frames': ' フレーム', 'lean_deg': ' 度'}
     lines = []
     for key, m in metrics.items():
         before = fmt(m['before']) if 'before' in m else '-'
@@ -176,6 +182,7 @@ def _bands(ax, flags, color, alpha=0.18):
 def save_plots(r, out_dir):
     # pyplot を使わない（ノートブックの描画バックエンドを変えないため）
     from matplotlib.figure import Figure
+    from scipy.ndimage import gaussian_filter1d
 
     out_dir = Path(out_dir)
     k, cfg = r.scale, r.config
@@ -270,6 +277,36 @@ def save_plots(r, out_dir):
         fig.tight_layout()
         paths['ground'] = out_dir / 'ground.png'
         fig.savefig(paths['ground'], dpi=110)
+
+    # 2d. 前後の傾きの補正（支持点の中心から重心への線の傾きと、補正角）
+    if r.lean is not None and r.lean.enabled:
+        fig = Figure(figsize=(12, 4))
+        ax = fig.subplots()
+        _bands(ax, r.contact.flags.any(1), 'tab:green', alpha=0.12)
+        sigma = max(float(cfg.lean.window_sec), 0.5) * r.fps
+        for vals, color, name in ((r.lean.before_deg, '0.6', 'before'),
+                                  (r.lean.after_deg, 'tab:red', 'after')):
+            ok = np.isfinite(vals)
+            ax.scatter(frames, vals, s=3, color=color, alpha=0.5)
+            mean = (gaussian_filter1d(np.where(ok, vals, 0.0), sigma, mode='constant')
+                    / np.maximum(gaussian_filter1d(ok * 1.0, sigma, mode='constant'), 1e-9))
+            ax.plot(frames, mean, color=color, lw=1.5, label=f'COM lean: {name} (dots) / '
+                    'windowed mean (line)')
+        ax.plot(frames, np.rad2deg(r.lean.angle), color='tab:purple', lw=1.5,
+                label='applied correction (upper body rotation)')
+        ax.axhline(0.0, color='k', lw=0.6)
+        ax.set_title('lean toward (+) / away from (-) the camera: angle of the line from the support '
+                     f'center to the whole-body COM, median {np.nanmedian(r.lean.before_deg):+.1f} -> '
+                     f'{np.nanmedian(r.lean.after_deg):+.1f} deg; green = a foot is in contact',
+                     fontsize=10)
+        ax.set_ylabel('angle [deg]')
+        ax.set_xlabel('frame')
+        lim = np.nanpercentile(np.abs(np.concatenate([r.lean.before_deg, r.lean.after_deg])), 98)
+        ax.set_ylim(-max(10.0, 1.2 * lim), max(10.0, 1.2 * lim))
+        ax.legend(loc='upper right', fontsize=8)
+        fig.tight_layout()
+        paths['lean'] = out_dir / 'lean.png'
+        fig.savefig(paths['lean'], dpi=110)
 
     # 3. 届く高さへのクランプの補正量
     fig = Figure(figsize=(12, 3.5))

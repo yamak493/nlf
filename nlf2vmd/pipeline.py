@@ -19,6 +19,7 @@ from .filters import runs
 from .foot_ik import boundary_steps, build_foot_ik
 from .ground import floating_frames, ground_offset
 from .jitter import stabilize_pose, stabilize_root
+from .lean import estimate_lean
 from .motion_io import load_motion
 from .pmx import PmxModel, read_pmx
 from .retarget import Retargeter
@@ -55,6 +56,7 @@ class ConversionResult:
     plot_paths: dict = field(default_factory=dict)
     depth: object = None
     ground: object = None
+    lean: object = None
 
 
 def resolve_skeleton(pmx):
@@ -207,17 +209,24 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
 
     # ---- 6a. 接地の拘束（両足が長く浮いた・埋まった状態を、体全体の上下の平行移動で床に戻す） ----
     # ---- 6. 接地判定（速度は奥行きのぶれを除いて求める） ----
+    # ---- 6c. 前後の傾きの補正（重心が接地している足の上に来るように、骨盤から上を起こす） ----
     # ---- 6b. 奥行きの再構成（接地している足から骨盤の奥行きを求め直す） ----
     # 2 回目以降は、奥行きを補正した体でもう一度接地を判定する（両足が同時に前後へ動いて見えて
     # 判定から漏れたフレームを拾い、その区間も含めて奥行きを求め直す）。奥行きの軸は床の傾きを補正すると
-    # 上下の成分を持つので、接地の拘束は奥行きを補正した体に毎回掛け直す
+    # 上下の成分を持つので、接地の拘束は奥行きを補正した体に毎回掛け直す。
+    # 前後の傾きは 1 回目の接地判定のあとに 1 度だけ求める。足首から下は動かさないので接地判定は変わらず、
+    # 奥行きの再構成は傾きを補正した足首→骨盤の相対位置を使う（平滑化する前の姿勢にも同じ補正を掛ける）
     axis = depth_axis(floor.rotation)
     ground = ground_offset(kin, fps, k, cfg.ground)
     judged = ground.apply(kin)
+    kin_pose, lean = kin_raw, None
     for _ in range(max(1, int(cfg.depth.passes)) if cfg.depth.reconstruct else 1):
         contact = detect_contacts(judged.contact_points, fps, cfg.contact, unit=k,
                                   speeds=detection_speeds(judged, axis, fps, k, cfg.depth))
-        depth = reconstruct_depth(kin, kin_raw, contact, axis, fps, k, cfg.depth)
+        if lean is None:
+            lean = estimate_lean(judged, contact, axis, rest, fps, k, cfg.lean, ground.flight)
+            kin, kin_pose = lean.apply(kin), lean.apply(kin_raw)
+        depth = reconstruct_depth(kin, kin_pose, contact, axis, fps, k, cfg.depth)
         moved = depth.apply(kin)
         ground = ground_offset(moved, fps, k, cfg.ground)
         judged = ground.apply(moved)
@@ -227,6 +236,15 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
             f'{-ground.offset.min() / k * 100:.1f} cm / ジャンプとして残した区間 '
             f'{len(runs(ground.flight))}')
     log(f'[6] 接地区間: 左 {len(contact.segments[0])} / 右 {len(contact.segments[1])}')
+    if lean.enabled:
+        deg = np.rad2deg(lean.angle)
+        log(f'[6c] 前後の傾きの補正: {deg.min():+.1f} 〜 {deg.max():+.1f} 度（重心の傾き '
+            f'{np.nanmedian(lean.before_deg):+.1f} → {np.nanmedian(lean.after_deg):+.1f} 度）')
+        if lean.clamped:
+            warn(f'前後の傾きの補正角が上限（lean.max_deg = {cfg.lean.max_deg} 度）に当たりました。'
+                 '接地判定（contact.png）と lean.png を確認してください')
+    elif cfg.lean.enabled:
+        log('[6c] 前後の傾きの補正: 接地しているフレームが少ないので補正しません')
     if depth.enabled:
         log(f'[6b] 奥行きの補正: 最大 {np.abs(depth.correction).max() / k * 100:.1f} cm')
 
@@ -266,7 +284,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     result = ConversionResult(
         str(out_path), n_keys, cfg, fps, k, motion, quats, kin, kin_raw, floor, contact, ik,
         center, ankle_rest, geom, rt.global_matrix('下半身', kin_raw.glob_rot), local, tracks,
-        warnings=warns, depth=depth, ground=ground)
+        warnings=warns, depth=depth, ground=ground, lean=lean)
     result.info = dict(
         frames=motion.num_frames, fps=fps, source_fps=motion.source_fps, scale=k,
         smpl_leg_length_m=smpl_leg, mmd_leg_length=skel.mean_leg_length(),
@@ -289,6 +307,14 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
                                            (depth_jitter(kin_raw.root_pos, axis) / k * 100.0)
                                            .tolist())),
                    max_correction_cm=float(np.abs(depth.correction).max() / k * 100.0)),
+        lean=dict(enabled=lean.enabled, direction=lean.direction.tolist(),
+                  correction_deg=dict(zip(('min', 'median', 'max'), np.percentile(
+                      np.rad2deg(lean.angle), [0, 50, 100]).tolist())),
+                  com_lean_deg=dict(before=float(np.nanmedian(lean.before_deg))
+                                    if lean.enabled else None,
+                                    after=float(np.nanmedian(lean.after_deg))
+                                    if lean.enabled else None),
+                  supported_frames=int(lean.supported.sum()), clamped=lean.clamped),
         ground=dict(enabled=ground.enabled, window_frames=ground.window,
                     correction_cm=dict(min=float(-ground.offset.max() / k * 100.0),
                                        max=float(-ground.offset.min() / k * 100.0)),

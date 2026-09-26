@@ -64,12 +64,15 @@ def _stance_frames(num_frames, fps, step_sec):
 
 
 def synthetic_walk(num_frames=180, fps=30.0, speed=1.0, heading_deg=0.0, step_sec=0.6,
-                   lift=0.08, noise_deg=0.0, seed=0, sway=0.0, sway_hz=1.5):
+                   lift=0.08, noise_deg=0.0, seed=0, sway=0.0, sway_hz=1.5, lean_deg=0.0,
+                   pelvis_shift=0.0):
     """heading_deg の向きに一定速度で歩く（体もその向きを向く）合成モーション。Y 上向き座標。
 
     支持脚の足首は床に固定し（倒立振子のように骨盤が上下する）、遊脚は足首の軌道を
     2 リンクの IK で解く。足は常に床と平行。heading_deg=0 で +Z（SMPL の正面）に進む。
     sway [m] を指定すると、骨盤が進行方向に sway_hz で前後に揺れる（足は床に着いたまま）。
+    lean_deg を指定すると、足を床に着けたまま体全体を前へ傾ける（骨盤から上を X 軸まわりに回し、骨盤を
+    その高さ × tan だけ前へずらす。単眼推定の前後の傾きの誤差）。pelvis_shift [m] は骨盤だけを前へずらす。
     戻り値は load_motion に渡せる dict（'stance' に正解の接地フラグ (T, 2) を入れる）。
     """
     rng = np.random.default_rng(seed)
@@ -79,8 +82,13 @@ def synthetic_walk(num_frames=180, fps=30.0, speed=1.0, heading_deg=0.0, step_se
     k = np.floor(t / step_sec + 1e-9)
     s = t / step_sec - k
     P, v = step_sec, speed
-    hip_off = J[[1, 2]] - J[0]
-    pelvis_z = v * t + sway * np.sin(2 * np.pi * sway_hz * t)
+    pitch = np.deg2rad(lean_deg)
+    c, s_ = np.cos(pitch), np.sin(pitch)
+    tilt = np.array([[1.0, 0.0, 0.0], [0.0, c, -s_], [0.0, s_, c]])   # +Y を +Z（前）へ倒す
+    hip_off = (J[[1, 2]] - J[0]) @ tilt.T
+    stand = J[0, 1] - J[ANKLES, 1].mean() + ANKLE_HEIGHT               # 直立時の骨盤の高さ
+    pelvis_z = (v * t + sway * np.sin(2 * np.pi * sway_hz * t) + pelvis_shift
+                + stand * np.tan(pitch))
 
     # 各足の足首の目標（体のローカル座標: z = 前, y = 上）
     foot = np.zeros((num_frames, 2, 2))
@@ -102,7 +110,8 @@ def synthetic_walk(num_frames=180, fps=30.0, speed=1.0, heading_deg=0.0, step_se
     pelvis_y = ANKLE_HEIGHT + np.sqrt(L ** 2 - d ** 2) - hip_off[sup, 1]
 
     q = np.tile(quat.IDENTITY, (num_frames, 24, 1))
-    q[:, 0] = _axis_angle([0, 1, 0], np.full(num_frames, np.deg2rad(heading_deg)))
+    q[:, 0] = quat.mul(_axis_angle([0, 1, 0], np.full(num_frames, np.deg2rad(heading_deg))),
+                       _axis_angle([1, 0, 0], np.full(num_frames, pitch)))
     for side in range(2):
         hip, knee, ankle = 1 + side, 4 + side, 7 + side
         l1, l2 = lengths[side]
@@ -117,7 +126,7 @@ def synthetic_walk(num_frames=180, fps=30.0, speed=1.0, heading_deg=0.0, step_se
         th_t = alpha + beta
         a_hip = th_t0 - th_t                          # X 軸まわり（正 = 脚が後ろへ）
         a_knee = (th_s0 - th_t0) - (-phi)             # 膝は後ろへ曲がる
-        q[:, hip] = _axis_angle([1, 0, 0], a_hip)
+        q[:, hip] = _axis_angle([1, 0, 0], a_hip - pitch)       # 骨盤の傾きを打ち消して脚の向きにする
         q[:, knee] = _axis_angle([1, 0, 0], a_knee)
         q[:, ankle] = _axis_angle([1, 0, 0], -(a_hip + a_knee))   # 足裏を床と平行に保つ
     arm = np.deg2rad(15.0) * np.sin(np.pi * t / P)

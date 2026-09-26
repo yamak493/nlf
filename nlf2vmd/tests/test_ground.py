@@ -79,7 +79,7 @@ def test_hovering_longer_than_a_jump_is_grounded(tmp_path, body_model):
 def test_grounding_only_translates_the_body_vertically(tmp_path, body_model):
     motion = add_ray_drift(to_camera_coords(synthetic_walk(num_frames=200, speed=0.0, seed=0),
                                             height=1.6))
-    off = ['depth.reconstruct=false']
+    off = ['depth.reconstruct=false', 'lean.enabled=false']   # 前後の傾きの補正は骨盤の高さを使うので切る
     r = _convert(tmp_path, body_model, motion, off, 'on.vmd')
     r0 = _convert(tmp_path, body_model, motion, off + ['ground.enabled=false'], 'off.vmd')
     shift = r.kin.joints - r0.kin.joints
