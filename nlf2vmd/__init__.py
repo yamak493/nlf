@@ -8,5 +8,7 @@
 from .body_model import BodyModel
 from .config import dump_config, load_config
 from .pipeline import ConversionResult, convert
+from .variants import VARIANTS, write_variant
 
-__all__ = ['BodyModel', 'ConversionResult', 'convert', 'dump_config', 'load_config']
+__all__ = ['BodyModel', 'ConversionResult', 'VARIANTS', 'convert', 'dump_config', 'load_config',
+           'write_variant']

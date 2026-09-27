@@ -57,6 +57,8 @@ class ConversionResult:
     depth: object = None
     ground: object = None
     lean: object = None
+    skeleton: object = None      # 対象モデルの骨格（variants.py で種類別のキーを作り直すのに使う）
+    retargeter: object = None
 
 
 def resolve_skeleton(pmx):
@@ -105,20 +107,25 @@ def apply_scale(kin, k, depth_scale):
 
 
 def build_tracks(skel, center_delta, ik, local, contact, cfg_vmd, unit):
-    """VMD のキー列を作る（MMD 座標へ変換し、必要なら間引く）。"""
-    T = len(center_delta)
+    """VMD のキー列を作る（MMD 座標へ変換し、必要なら間引く）。
+
+    center_delta / ik が None なら、センター・グルーブ / 足ＩＫのキーは打たない。
+    """
+    T = len(contact.flags)
     frames = np.arange(T)
     identity = np.tile(quat.IDENTITY, (T, 1))
     zeros = np.zeros((T, 3))
     items = []   # (名前, 位置 (内部座標), 回転 (内部座標), 必ず残すフレーム)
-    if skel.has('グルーブ'):
+    if center_delta is None:
+        pass
+    elif skel.has('グルーブ'):
         items.append(('センター', center_delta * [1.0, 0.0, 1.0], identity, ()))
         items.append(('グルーブ', center_delta * [0.0, 1.0, 0.0], identity, ()))
     else:
         items.append(('センター', center_delta, identity, ()))
     for name, q in local.items():
         items.append((name, zeros, q, ()))
-    for side, s in enumerate(SIDES):
+    for side, s in enumerate(SIDES if ik is not None else ()):
         forced = sorted({f for seg in contact.segments[side] for f in seg})
         items.append((s + '足ＩＫ', ik.delta[:, side], ik.rotation[:, side], forced))
 
@@ -137,9 +144,11 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
             diag_dir=None, log=print):
     """NLF のモーション（npz のパス、または pose / betas / trans / fps を持つ dict）を VMD に変換する。
 
+    out_path: 書き出す .vmd（フル: 体の動きすべて）。None なら書き出さない（variants.write_variant で
+    種類を選んで書き出す）
     pmx: 対象モデルの .pmx（None なら標準ボーンの寸法）/ body_model: SMPL 体モデルの npz
     config: 設定ファイルのパス・dict・Config / overrides: ['center.mode=B', ...]
-    diag_dir: 診断出力（JSON・PNG）の保存先。None なら <VMD 名>_diag/
+    diag_dir: 診断出力（JSON・PNG）の保存先。None なら <VMD 名>_diag/（out_path も None なら保存しない）
     """
     cfg = config if isinstance(config, Config) and not overrides else load_config(config,
                                                                                   overrides)
@@ -276,15 +285,17 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     # ---- 10. VMD 書き出しと診断出力 ----
     tracks = build_tracks(skel, center.delta, ik, local, contact, cfg.vmd, k)
     model_name = cfg.vmd.model_name or skel.model_name or 'nlf2vmd'
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    n_keys = write_vmd(out_path, tracks, model_name)
-    log(f'[10] VMD を書き出しました: {out_path}（ボーン {len(tracks)} 本 / キー {n_keys}）')
+    n_keys = 0
+    if out_path is not None:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        n_keys = write_vmd(out_path, tracks, model_name)
+        log(f'[10] VMD を書き出しました: {out_path}（ボーン {len(tracks)} 本 / キー {n_keys}）')
 
     result = ConversionResult(
-        str(out_path), n_keys, cfg, fps, k, motion, quats, kin, kin_raw, floor, contact, ik,
-        center, ankle_rest, geom, rt.global_matrix('下半身', kin_raw.glob_rot), local, tracks,
-        warnings=warns, depth=depth, ground=ground, lean=lean)
+        str(out_path or ''), n_keys, cfg, fps, k, motion, quats, kin, kin_raw, floor, contact,
+        ik, center, ankle_rest, geom, rt.global_matrix('下半身', kin_raw.glob_rot), local, tracks,
+        warnings=warns, depth=depth, ground=ground, lean=lean, skeleton=skel, retargeter=rt)
     result.info = dict(
         frames=motion.num_frames, fps=fps, source_fps=motion.source_fps, scale=k,
         smpl_leg_length_m=smpl_leg, mmd_leg_length=skel.mean_leg_length(),
@@ -326,9 +337,14 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         warnings=warns)
 
     if cfg.diagnostics.enabled:
-        diag = Path(diag_dir) if diag_dir else out_path.with_name(out_path.stem + '_diag')
-        diag.mkdir(parents=True, exist_ok=True)
         result.metrics = diagnostics.compute_metrics(result)
+        if diag_dir:
+            diag = Path(diag_dir)
+        elif out_path is not None:
+            diag = out_path.with_name(out_path.stem + '_diag')
+        else:
+            return result
+        diag.mkdir(parents=True, exist_ok=True)
         result.diagnostics_path = str(diagnostics.save_json(
             diag / 'diagnostics.json', dict(metrics=result.metrics, info=result.info,
                                             config=cfg.to_dict())))

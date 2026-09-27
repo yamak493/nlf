@@ -6,6 +6,7 @@ from pathlib import Path
 from .config import dump_config, load_config
 from .diagnostics import format_metrics
 from .pipeline import convert
+from .variants import LABELS, write_variant
 
 
 def main(argv=None):
@@ -20,6 +21,10 @@ def main(argv=None):
     ap.add_argument('--config', help='設定ファイル（YAML / JSON）。書いた項目だけ既定値を上書き')
     ap.add_argument('--set', action='append', default=[], metavar='KEY=VALUE',
                     help='設定を 1 項目上書き（例: --set center.mode=B）。複数指定可')
+    ap.add_argument('--variants', default='full', metavar='KIND[,KIND...]',
+                    help='書き出す種類（カンマ区切り）: full = フル（既定。-o の名前）/ no_move = 移動なし'
+                         '（<出力名>_no_move.vmd）/ upper_body = 上半身のみ（<出力名>_upper_body.vmd）。'
+                         '口パクは python -m nlf2vmd.lipsync --merge で足す')
     ap.add_argument('--diag-dir', help='診断出力（JSON・PNG）の保存先（既定: <出力名>_diag）')
     ap.add_argument('--no-plots', action='store_true', help='グラフを出力しない')
     ap.add_argument('--dump-config', metavar='PATH', help='既定値（＋上書き）を YAML に書き出して終了')
@@ -47,8 +52,20 @@ def main(argv=None):
         source = args.input
         output = args.output or str(Path(args.input).with_suffix('.vmd'))
 
-    result = convert(source, output, pmx=args.pmx, body_model=body_model, config=args.config,
-                     overrides=overrides, diag_dir=args.diag_dir)
+    kinds = [k.strip() for k in args.variants.split(',') if k.strip()]
+    unknown = [k for k in kinds if k not in ('full', 'no_move', 'upper_body')]
+    if unknown or not kinds:
+        ap.error('--variants は full / no_move / upper_body をカンマ区切りで指定してください: '
+                 + args.variants)
+    output = Path(output)
+    result = convert(source, output if 'full' in kinds else None, pmx=args.pmx,
+                     body_model=body_model, config=args.config, overrides=overrides,
+                     diag_dir=args.diag_dir or output.with_name(output.stem + '_diag'))
+    for kind in kinds:
+        if kind != 'full':
+            path = output.with_name(f'{output.stem}_{kind}.vmd')
+            n = write_variant(result, kind, path)
+            print(f'{LABELS[kind]} の VMD を書き出しました: {path}（キー {n}）')
     if result.metrics:
         print('\n評価指標（処理前 → 処理後）:')
         for line in format_metrics(result.metrics):

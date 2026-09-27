@@ -334,6 +334,39 @@ def build_lipsync(analysis, cfg, fps=30.0, num_frames=None, available_morphs=Non
                          phones, cfg, info, warns)
 
 
+def make_lipsync(analysis, pmx=None, config=None, overrides=None, plot_path=None, log=print):
+    """口のモーフのキーを作る（VMD は書き出さない。result.tracks を variants.write_variant などに渡す）。
+
+    pmx: モデルの .pmx（モーフ名があるか確かめる）/ config・overrides: load_config と同じ
+    plot_path: グラフ（PNG）の保存先。モデル名は info['model_name']（PMX が無ければ空）
+    """
+    from .config import load_config
+    from .pmx import read_pmx
+
+    log = log or (lambda *a: None)
+    cfg = load_config(config, overrides)
+    model_name, available = '', None
+    if pmx:
+        model = read_pmx(pmx)
+        model_name = model.name
+        if model.morphs is None:
+            log('⚠️ PMX のモーフを読めなかったので、モーフ名があるかは確かめません')
+        else:
+            available = model.morph_names()
+    result = build_lipsync(analysis, cfg.lipsync, fps=float(cfg.input.target_fps),
+                           available_morphs=available, log=log)
+    result.info['model_name'] = model_name
+    log(f'[口パク] 声の区間 {result.info["voiced_runs"]}（計 {result.info["voiced_sec"]:.1f} 秒）/ '
+        f'使った音素 {result.info["phones_in_voice"]} / {result.info["phones"]}')
+    log('    キー: ' + ' / '.join(f'{k} {v}' for k, v in result.info['keys'].items()))
+    if plot_path:
+        try:
+            result.info['plot'] = str(save_plot(result, plot_path))
+        except ImportError:
+            log('⚠️ matplotlib が無いのでグラフは出力しません')
+    return result
+
+
 def export_lipsync(analysis, out_path, motion_vmd=None, merged_path=None, pmx=None, config=None,
                    overrides=None, plot_path=None, log=print):
     """口のモーフのキーを作り、out_path に口パクだけの VMD を、merged_path に motion_vmd（体の動き）と
@@ -341,31 +374,16 @@ def export_lipsync(analysis, out_path, motion_vmd=None, merged_path=None, pmx=No
 
     pmx: モデルの .pmx（モーフ名があるか確かめる）/ config・overrides: load_config と同じ
     """
-    from .config import load_config
-    from .pmx import read_pmx
-
     log = log or (lambda *a: None)
-    cfg = load_config(config, overrides)
-    model_name, available = 'nlf2vmd', None
-    if motion_vmd and Path(motion_vmd).exists():
-        model_name = read_vmd(motion_vmd).model_name or model_name
-    if pmx:
-        model = read_pmx(pmx)
-        model_name = model.name or model_name
-        if model.morphs is None:
-            log('⚠️ PMX のモーフを読めなかったので、モーフ名があるかは確かめません')
-        else:
-            available = model.morph_names()
-    result = build_lipsync(analysis, cfg.lipsync, fps=float(cfg.input.target_fps),
-                           available_morphs=available, log=log)
-
+    result = make_lipsync(analysis, pmx=pmx, config=config, overrides=overrides,
+                          plot_path=plot_path, log=log)
+    model_name = result.info['model_name']
+    if not model_name and motion_vmd and Path(motion_vmd).exists():
+        model_name = read_vmd(motion_vmd).model_name
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    n = write_vmd(out_path, [], model_name, morphs=result.tracks)
+    n = write_vmd(out_path, [], model_name or 'nlf2vmd', morphs=result.tracks)
     result.info['vmd'] = str(out_path)
-    log(f'[口パク] 声の区間 {result.info["voiced_runs"]}（計 {result.info["voiced_sec"]:.1f} 秒）/ '
-        f'使った音素 {result.info["phones_in_voice"]} / {result.info["phones"]}')
-    log('    キー: ' + ' / '.join(f'{k} {v}' for k, v in result.info['keys'].items()))
     log(f'    口パクだけの VMD: {out_path}（キー {n}）')
     if motion_vmd and merged_path:
         if Path(motion_vmd).exists():
@@ -374,11 +392,6 @@ def export_lipsync(analysis, out_path, motion_vmd=None, merged_path=None, pmx=No
             log(f'    体の動き＋口パクの VMD: {merged_path}（キー {n}）')
         else:
             log(f'⚠️ {motion_vmd} が無いので、体の動きとの合成はしません')
-    if plot_path:
-        try:
-            result.info['plot'] = str(save_plot(result, plot_path))
-        except ImportError:
-            log('⚠️ matplotlib が無いのでグラフは出力しません')
     return result
 
 

@@ -19,8 +19,8 @@ MikuMikuDance / MikuMikuMoving 用の VMD に変換します。仕様は [vmd.md
 
 ### ノートブックから
 
-`mp4_to_mannequin_ja.ipynb` のセル 14 を実行すると `nlf_mannequin/motion.vmd` ができます。
-同じフォルダに、変換の入力 `motion_for_vmd.npz` と体モデル `smpl_body_model.npz` も保存されます。
+`mp4_to_mannequin_ja.ipynb` のセル 14 で変換し、セル 16 で選んだ種類の VMD（既定は `nlf_mannequin/motion_full.vmd`）を
+書き出します（[出力の種類](#出力の種類)）。同じフォルダに、変換の入力 `motion_for_vmd.npz` と体モデル `smpl_body_model.npz` も保存されます。
 
 ### コマンドラインから
 
@@ -29,6 +29,9 @@ MikuMikuDance / MikuMikuMoving 用の VMD に変換します。仕様は [vmd.md
 ```bash
 # ノートブックが保存した入力と体モデルから変換（体モデルは同じフォルダにあれば自動で使われます）
 python -m nlf2vmd motion_for_vmd.npz -o motion.vmd --pmx モデル.pmx
+
+# 移動なし・上半身のみも書き出す（motion_no_move.vmd / motion_upper_body.vmd。full を外すと motion.vmd は書かない）
+python -m nlf2vmd motion_for_vmd.npz -o motion.vmd --pmx モデル.pmx --variants full,no_move,upper_body
 
 # 設定を 1 項目ずつ変える
 python -m nlf2vmd motion_for_vmd.npz --pmx モデル.pmx --set center.mode=B --set scale.depth_scale=0.5
@@ -49,6 +52,17 @@ from nlf2vmd import convert
 result = convert('motion_for_vmd.npz', 'motion.vmd', pmx='モデル.pmx',
                  overrides=['center.mode=B'])
 print(result.metrics['foot_slide_cm_per_frame'])   # {'before': ..., 'after': ...}
+
+# 出力の種類を選んで書き出す（convert の出力先を None にすると、convert は VMD を書かない）
+from nlf2vmd import write_variant
+from nlf2vmd.lipsync import make_lipsync
+
+result = convert('motion_for_vmd.npz', None, pmx='モデル.pmx', diag_dir='vmd_diag')
+lip = make_lipsync('lipsync_analysis.npz', pmx='モデル.pmx')   # 口パク（任意）
+write_variant(result, 'full', 'motion_full.vmd', morphs=lip.tracks)
+write_variant(result, 'no_move', 'motion_full_no_move.vmd', morphs=lip.tracks)
+write_variant(result, 'upper_body', 'motion_upper_body.vmd')
+write_variant(result, 'face', 'motion_face.vmd', morphs=lip.tracks)
 ```
 
 `convert` の入力は npz のパスか、同じキーを持つ dict です。
@@ -79,6 +93,26 @@ smplfitter（SMPL 公式ファイル）の順に探します。
 足・ひざ・足首・つま先ＩＫ・捩りボーンにはキーを打ちません。キーは全フレームに打ちます（`vmd.thin_keys` で間引き可）。
 PMX を指定しないときは、標準的な体格（身長 20 単位前後・A ポーズ）のボーン寸法で変換します。
 **実際に使うモデルの PMX を指定するのがおすすめです**（脚長とボーンの向きをモデルから読みます）。
+
+### 出力の種類
+
+`variants.py`（`write_variant`）で、変換結果から次の 4 種類を書き出せます。ノートブックではセル 16 で選びます（既定はフルのみ）。
+
+| 種類 | `kind` | ノートブックのファイル | 内容 |
+|---|---|---|---|
+| フル | `full` | `motion_full.vmd` | 上の表のボーンすべて（`convert` の出力と同じ）＋口パク |
+| フル [移動なし] | `no_move` | `motion_full_no_move.vmd` | フルから体の水平移動を除いたもの＋口パク。センターの X・Z は 0 で、足はその場で足踏みする |
+| 上半身のみ | `upper_body` | `motion_upper_body.vmd` | 上半身・上半身2・首・頭・肩・腕・ひじ・手首の回転だけ。体全体の向きは除く |
+| 表情のみ | `face` | `motion_face.vmd` | 口パクのモーフのキーだけ |
+
+* **フル [移動なし]**: 足ＩＫの水平位置を、足ごとに「足跡のずらし量」だけずらします。足が着いている間（足跡）はずらし量が一定
+  （その間のセンターの平均位置）なので、足は床を滑りません。足が浮いている間は、足が前の足跡から次の足跡へ進んだ割合だけずらし量を進めるので、
+  足はその場で上下しながら次の足跡へ移ります。接地判定が 1 つの接地を 2 つに割った所（ロック位置の差が 10cm 未満）は 1 つの足跡にまとめ、
+  判定が遅れた・早く切れたフレームも足が止まっていれば（3cm 以内）足跡に含めます。上下（グルーブ）はひざの曲げ・しゃがみ・ジャンプの
+  高さなので残し、足をずらした脚が届く高さへのクランプだけ掛け直します（上下も除くと脚が床に届かず、足が浮きます）
+* **上半身のみ**: センター・下半身にキーを打たないので、上半身の回転は大域回転になります。そこから下半身の鉛直軸まわりの向きを除くので、
+  振り向いても上半身だけが回ることはなく、下半身に対するひねり・おじぎ・体の傾きは残ります。ほかのモーションのあとに追加で読み込むと、
+  上半身から先だけを差し替えられます
 
 診断出力（既定: `<VMD 名>_diag/`）:
 
@@ -113,7 +147,8 @@ PMX を指定しないときは、標準的な体格（身長 20 単位前後・
    言語を `jpn` にすると日本語の音素だけで認識するので、母音がそのまま「あいうえお」に分かれる
 3. 認識結果（音素と時刻）とボーカルの音量を `lipsync_analysis.npz` に保存する
 
-セル 15a（または下のコマンド）が、`lipsync.py` で口のモーフのキーにします。
+セル 15a（または下のコマンド）が、`lipsync.py` で口のモーフのキーにします（ノートブックでは、セル 16 で選んだフル・フル [移動なし]・
+表情のみの VMD に入れます）。
 
 * 母音はあ・い・う・え・お（IPA の母音を近い日本語の母音へ。唇を丸める母音は う・お へ）、両唇音 m・b・p と撥音 ɴ は ん（口を閉じる）。
   子音は形を持たず、すぐ後の母音の形を子音の時刻から始める（日本語の子音は次の母音の口の形のまま発音されるため）
@@ -191,6 +226,7 @@ MMD で見て問題があったときの調整の目安:
 | 8. センター安定化 | `center.py` |
 | 9. 上半身の回転リターゲット | `retarget.py` |
 | 10. VMD 書き出しと診断出力 | `vmd.py`、`diagnostics.py` |
+| 出力の種類（フル [移動なし]・上半身のみ など） | `variants.py` |
 | 口パク（リップシンク） | `lipsync.py`（モーフのキーの読み書き・合成は `vmd.py`、モデルのモーフ名は `pmx.py`） |
 
 全体の順番は `pipeline.py` の `convert` にあります。順番は入れ替えないでください（vmd.md 参照）。
