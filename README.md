@@ -17,6 +17,7 @@ Training code is provided for both PyTorch and TensorFlow.
 3. 元動画の音声付き mp4 として書き出し、
 4. モーションを FBX（`motion.fbx`：スケルトン＋スキン付きマネキン＋アニメーション）でも書き出し、
 5. モーションを MMD 用の VMD（`motion.vmd`）でも書き出す（変換は [`nlf2vmd`](nlf2vmd/README.md)、仕様は [`vmd.md`](vmd.md)。GPU 不要のコマンドライン `python -m nlf2vmd` でも実行できます）
+6. 動画の音声から [Demucs](https://github.com/adefossez/demucs) でボーカルを取り出し、[Allosaurus](https://github.com/xinjli/allosaurus) で母音を認識して、VMD に口のモーフ（「あ」「い」「う」「え」「お」「ん」）のキーを入れる（`motion_lipsync.vmd`。口パクだけの `lipsync.vmd` も書き出します）
 
 という一連の処理を行う日本語ノートブックです。SMPL 公式ファイルが無くても動作します
 （[SMPLFitter](https://github.com/isarandi/smplfitter) は NLF の内部でも使われています）。

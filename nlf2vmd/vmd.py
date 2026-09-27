@@ -5,7 +5,9 @@
   ボーンキー数 uint32 ＋ 1 キー 111 バイト
     ボーン名 15 バイト（cp932） / フレーム番号 uint32 / 位置 float32×3 / 回転 float32×4 (x,y,z,w)
     / 補間パラメータ 64 バイト
-  モーフ・カメラ・照明・セルフ影のキー数（このツールではどれも 0）
+  モーフキー数 uint32 ＋ 1 キー 23 バイト（口パク。キーの間は MMD が線形に補間する）
+    モーフ名 15 バイト（cp932） / フレーム番号 uint32 / 値 float32
+  カメラ・照明・セルフ影のキー数（このツールではどれも 0）
 
 補間パラメータ 64 バイトの配置は MMD Tools（blender_mmd_tools）の実装で確認したもの:
   書き出し core/vmd/exporter.py の __getVMDBoneInterpolation
@@ -17,7 +19,7 @@
 """
 import struct
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -26,6 +28,8 @@ BONE_KEY_DTYPE = np.dtype([
     ('name', 'S15'), ('frame', '<u4'), ('position', '<f4', 3), ('rotation', '<f4', 4),
     ('interp', 'u1', 64)])
 assert BONE_KEY_DTYPE.itemsize == 111
+MORPH_KEY_DTYPE = np.dtype([('name', 'S15'), ('frame', '<u4'), ('weight', '<f4')])
+assert MORPH_KEY_DTYPE.itemsize == 23
 
 # MMD 座標へ: 位置 (x, y, z) → (x, y, -z)、クォータニオン (x, y, z, w) → (-x, -y, z, w)
 POSITION_TO_MMD = np.array([1.0, 1.0, -1.0])
@@ -80,6 +84,14 @@ class BoneTrack:
     rotations: np.ndarray    # (N, 4) x, y, z, w
 
 
+@dataclass
+class MorphTrack:
+    """1 モーフ分のキー列（値は 0〜1）。"""
+    name: str
+    frames: np.ndarray       # (N,) int
+    weights: np.ndarray      # (N,)
+
+
 def to_mmd_position(p):
     return np.asarray(p, np.float64) * POSITION_TO_MMD
 
@@ -88,10 +100,8 @@ def to_mmd_quat(q):
     return np.asarray(q, np.float64) * QUAT_TO_MMD
 
 
-def write_vmd(path, tracks, model_name=''):
-    """tracks（BoneTrack のリスト）を VMD に書き出す。戻り値はキーの総数。"""
-    n = sum(len(t.frames) for t in tracks)
-    keys = np.zeros(n, BONE_KEY_DTYPE)
+def _bone_keys(tracks):
+    keys = np.zeros(sum(len(t.frames) for t in tracks), BONE_KEY_DTYPE)
     i = 0
     for t in tracks:
         m = len(t.frames)
@@ -101,15 +111,39 @@ def write_vmd(path, tracks, model_name=''):
         keys['rotation'][i:i + m] = t.rotations
         keys['interp'][i:i + m] = LINEAR_INTERPOLATION
         i += m
+    return keys
+
+
+def _morph_keys(morphs):
+    keys = np.zeros(sum(len(t.frames) for t in morphs), MORPH_KEY_DTYPE)
+    i = 0
+    for t in morphs:
+        m = len(t.frames)
+        keys['name'][i:i + m] = encode_name(t.name, 15, 'モーフ名')
+        keys['frame'][i:i + m] = np.asarray(t.frames, np.int64)
+        keys['weight'][i:i + m] = t.weights
+        i += m
+    return keys
+
+
+def _write_keys(path, model_name, bone_keys, morph_keys, tail=b''):
     # フレーム順に並べる（MMD はどちらでも読めるが、他のツールとの互換のため）
-    keys = keys[np.argsort(keys['frame'], kind='stable')]
+    bone_keys = bone_keys[np.argsort(bone_keys['frame'], kind='stable')]
+    morph_keys = morph_keys[np.argsort(morph_keys['frame'], kind='stable')]
     with open(path, 'wb') as f:
         f.write(struct.pack('<30s', SIGNATURE))
         f.write(struct.pack('<20s', encode_name(model_name, 20, 'モデル名')))
-        f.write(struct.pack('<I', n))
-        f.write(keys.tobytes())
-        f.write(struct.pack('<4I', 0, 0, 0, 0))   # モーフ・カメラ・照明・セルフ影
-    return n
+        f.write(struct.pack('<I', len(bone_keys)))
+        f.write(bone_keys.tobytes())
+        f.write(struct.pack('<I', len(morph_keys)))
+        f.write(morph_keys.tobytes())
+        f.write(tail or struct.pack('<3I', 0, 0, 0))   # カメラ・照明・セルフ影
+    return len(bone_keys) + len(morph_keys)
+
+
+def write_vmd(path, tracks, model_name='', morphs=()):
+    """tracks（BoneTrack のリスト）と morphs（MorphTrack のリスト）を VMD に書き出す。戻り値はキーの総数。"""
+    return _write_keys(path, model_name, _bone_keys(tracks), _morph_keys(morphs))
 
 
 @dataclass
@@ -117,9 +151,14 @@ class VmdMotion:
     model_name: str
     keys: np.ndarray          # BONE_KEY_DTYPE の配列
     counts: dict              # モーフ・カメラ・照明・セルフ影のキー数
+    morph_keys: np.ndarray = field(default_factory=lambda: np.zeros(0, MORPH_KEY_DTYPE))
+    tail: bytes = b''         # モーフより後ろ（カメラ・照明・セルフ影など）のそのままのバイト列
 
     def bone_names(self):
         return sorted({decode_name(n) for n in self.keys['name']})
+
+    def morph_names(self):
+        return sorted({decode_name(n) for n in self.morph_keys['name']})
 
     def track(self, name):
         """ボーン名のキーをフレーム順に (frames, positions, rotations) で返す。"""
@@ -128,6 +167,13 @@ class VmdMotion:
         k = k[np.argsort(k['frame'], kind='stable')]
         return (k['frame'].astype(np.int64), k['position'].astype(np.float64),
                 k['rotation'].astype(np.float64))
+
+    def morph_track(self, name):
+        """モーフ名のキーをフレーム順に (frames, weights) で返す。"""
+        raw = encode_name(name, 15, 'モーフ名')
+        k = self.morph_keys[self.morph_keys['name'] == raw]
+        k = k[np.argsort(k['frame'], kind='stable')]
+        return k['frame'].astype(np.int64), k['weight'].astype(np.float64)
 
 
 def read_vmd(path):
@@ -140,15 +186,34 @@ def read_vmd(path):
     pos = 54
     keys = np.frombuffer(data, BONE_KEY_DTYPE, count=n, offset=pos).copy()
     pos += n * BONE_KEY_DTYPE.itemsize
-    counts = {}
-    for name, size in (('morph', 23), ('camera', 61), ('light', 28), ('self_shadow', 9)):
+    morph_keys = np.zeros(0, MORPH_KEY_DTYPE)
+    if pos + 4 <= len(data):
+        (m,) = struct.unpack_from('<I', data, pos)
+        morph_keys = np.frombuffer(data, MORPH_KEY_DTYPE, count=m, offset=pos + 4).copy()
+        pos += 4 + m * MORPH_KEY_DTYPE.itemsize
+    tail = data[pos:]
+    counts = {'morph': len(morph_keys)}
+    for name, size in (('camera', 61), ('light', 28), ('self_shadow', 9)):
         if pos + 4 > len(data):
             counts[name] = 0
             continue
         (m,) = struct.unpack_from('<I', data, pos)
         counts[name] = m
         pos += 4 + m * size
-    return VmdMotion(model_name, keys, counts)
+    return VmdMotion(model_name, keys, counts, morph_keys, tail)
+
+
+def merge_morphs(src_path, morphs, out_path=None, model_name=None):
+    """src_path の VMD に morphs（MorphTrack のリスト）のキーを足して out_path（既定は上書き）に書く。
+
+    ボーン・カメラなどのキーはそのまま残す。同じ名前のモーフのキーが既にあれば置き換える
+    （まばたきなど、ほかのモーフのキーは残す）。戻り値はキーの総数。
+    """
+    src = read_vmd(src_path)
+    names = {encode_name(t.name, 15, 'モーフ名') for t in morphs}
+    kept = src.morph_keys[~np.isin(src.morph_keys['name'], list(names))]
+    return _write_keys(out_path or src_path, src.model_name if model_name is None else model_name,
+                       src.keys, np.concatenate([kept, _morph_keys(morphs)]), src.tail)
 
 
 # ---- キーの間引き（任意） ----
@@ -188,5 +253,19 @@ def thin_track(positions, rotations, pos_tol, rot_tol_deg, forced=()):
                        np.broadcast_to(rotations[b], (len(t), 4)), t)
         e_rot = quat.angle_between(q, rotations[a + 1:b]) / max(rot_tol, 1e-12)
         return np.maximum(e_pos, e_rot)
+
+    return _rdp_keep(err, n, [f for f in forced if 0 <= f < n])
+
+
+def thin_weights(weights, tol, forced=()):
+    """モーフの値の列で、線形補間したときの誤差が tol 以内なら、キーを省く。残すフレームの bool を返す。"""
+    w = np.asarray(weights, np.float64)
+    n = len(w)
+    if n <= 2:
+        return np.ones(n, bool)
+
+    def err(a, b):
+        t = (np.arange(a + 1, b) - a) / float(b - a)
+        return np.abs(w[a] + (w[b] - w[a]) * t - w[a + 1:b]) / max(tol, 1e-12)
 
     return _rdp_keep(err, n, [f for f in forced if 0 <= f < n])

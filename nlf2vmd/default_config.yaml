@@ -155,3 +155,39 @@ vmd:
 diagnostics:
   enabled: true
   plots: true
+
+# ---- 口パク（リップシンク）: ノートブックのセル 15a / python -m nlf2vmd.lipsync ----
+# Allosaurus で認識した音素を口の形（あ・い・う・え・お・ん）に分け、声が出ている間だけ口を動かす。
+# 音量は Demucs で取り出したボーカルのもの。dB のしきい値は「大きな声の音量（基準）」からの差で書く。
+lipsync:
+  morphs:                   # 口の形ごとのモーフ名（モデルに合わせて変える。'' でその形のキーを打たない）
+    a: あ
+    i: い
+    u: う
+    e: え
+    o: お
+    n: ん                   # 口を閉じる形（両唇音 m・b・p と撥音 ɴ）
+  strength: 1.0             # 母音のモーフの最大値
+  min_open: 0.3             # 小さな声のときの母音のモーフの値（strength に対する割合）。声が大きいほど 1 に近づく
+  open_range_db: 24.0       # 基準からこの dB 小さい声で min_open になる
+  closed_weight: 1.0        # ん のモーフの値（口を閉じる音は音量によらない）
+  reference_percentile: 95.0  # 基準 = ボーカルの音量のこのパーセンタイル（最大から voice_off_db より小さい音は除く）
+  noise_percentile: 10.0    # 雑音 = ボーカルの音量のこのパーセンタイル（Demucs で残った伴奏。声の無い所の音量）
+  min_reference_dbfs: -50.0 # 基準がこれ [dBFS] より小さければ声が無いとみなし、キーをすべて 0 にする
+  # 声の区間 = 音量が off より大きい連続区間のうち、on を超える時刻を含むもの（ヒステリシス）
+  #   on  = 基準+voice_on_db と 雑音+on_above_noise_db の大きいほう（ただし 基準+max_on_db まで）
+  #   off = 基準+voice_off_db と 雑音+off_above_noise_db の大きいほう（ただし on まで）
+  voice_on_db: -30.0
+  voice_off_db: -40.0
+  on_above_noise_db: 12.0
+  off_above_noise_db: 6.0
+  max_on_db: -15.0          # 間の無い歌で雑音の見積もりが声になっても、これより大きい声は声として扱う
+  fill_gap_sec: 0.05        # これ以下の無音の隙間は声が続いているとみなす
+  min_voice_sec: 0.06       # これより短い声の区間は捨てる（Demucs で残った伴奏・息など）
+  event_margin_sec: 0.1     # 声の区間の前後この時間までの音素は、その区間のものとして使う
+  lead_sec: 0.05            # 口の形を音より早く始める時間（口は声が出る少し前に形を作る）
+  consonant_sec: 0.25       # 子音から次の母音までがこれ以内なら、子音の時刻から次の母音の形にする
+  max_closed_sec: 0.3       # 声が出ている間に ん（口を閉じる）を続ける最長の時間。超えたら直前の母音に戻す
+  fallback_vowel: a         # 母音が 1 つも認識されなかった声の区間の口の形（a / i / u / e / o。null で口を動かさない）
+  smooth_sec: 0.03          # 形の切り替え・開き具合の変化をならすガウシアンの σ [秒]
+  thin_tolerance: 0.01      # キーの間引き: 線形補間との差がこれ以内なら省く（0 で全フレームにキー）

@@ -1,9 +1,10 @@
-"""PMX（2.0 / 2.1）の読み込み。変換に必要なボーン情報だけを取り出す。
+"""PMX（2.0 / 2.1）の読み込み。変換に必要なボーン情報と、モーフの名前だけを取り出す。
 
 頂点・面・テクスチャ・材質は読み飛ばす（ボーンはそれらの後ろに並んでいるため）。
+モーフ（口パクのキーを打つ先があるかの確認に使う）はボーンの後ろにある。
 """
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -20,16 +21,28 @@ class PmxBone:
 
 
 @dataclass
+class PmxMorph:
+    name: str
+    name_en: str
+    panel: int                # 1 = 眉 / 2 = 目 / 3 = 口 / 4 = その他
+    kind: int                 # 0 = グループ / 1 = 頂点 / 2 = ボーン / 3〜7 = UV / 8 = 材質 / 9 = フリップ / 10 = インパルス
+
+
+@dataclass
 class PmxModel:
     name: str
     name_en: str
     bones: list
+    morphs: list = field(default_factory=list)   # 読めなかったときは None
 
     def bone_index(self, name):
         for i, b in enumerate(self.bones):
             if b.name == name:
                 return i
         return -1
+
+    def morph_names(self):
+        return [m.name for m in self.morphs or []]
 
 
 class _Reader:
@@ -74,7 +87,8 @@ def read_pmx(path):
     r.f32()   # バージョン
     g = list(r.take(r.u8()))
     encoding = 'utf-16-le' if g[0] == 0 else 'utf-8'
-    n_uv, vsize, tsize, _msize, bsize = g[1], g[2], g[3], g[4], g[5]
+    n_uv, vsize, tsize, msize, bsize = g[1], g[2], g[3], g[4], g[5]
+    morph_size, rigid_size = (g[6], g[7]) if len(g) >= 8 else (4, 4)
 
     def text():
         return r.take(r.i32()).decode(encoding, errors='replace')
@@ -140,4 +154,22 @@ def read_pmx(path):
                 if r.u8():
                     r.vec(6)
         bones.append(PmxBone(bname, bname_en, pos, parent, flags, tail_index, tail_offset))
-    return PmxModel(name, name_en, bones)
+
+    # ---- モーフ（読めなくてもボーンは使えるので、失敗したら None にする） ----
+    morphs = []
+    if r.pos < len(r.data):
+        try:
+            # オフセット 1 つの大きさ（種類ごと）
+            offset_size = {0: morph_size + 4, 1: vsize + 12, 2: bsize + 28, 8: msize + 113,
+                           9: morph_size + 4, 10: rigid_size + 25}
+            offset_size.update({k: vsize + 16 for k in range(3, 8)})
+            for _ in range(r.i32()):
+                mname, mname_en = text(), text()
+                panel, kind = r.u8(), r.u8()
+                if kind not in offset_size:
+                    raise ValueError(f'未知のモーフの種類です: {kind}')
+                r.skip(r.i32() * offset_size[kind])
+                morphs.append(PmxMorph(mname, mname_en, panel, kind))
+        except (ValueError, struct.error):
+            morphs = None
+    return PmxModel(name, name_en, bones, morphs)

@@ -1,12 +1,14 @@
 """VMD: 書き出したファイルを自前のリーダーで読み戻し、ボーン名・フレーム数・値が一致すること。"""
+import struct
 import warnings
 
 import numpy as np
 import pytest
 
 from nlf2vmd import quat
-from nlf2vmd.vmd import (LINEAR_INTERPOLATION, BoneTrack, bone_interpolation, read_interpolation,
-                         read_vmd, thin_track, write_vmd)
+from nlf2vmd.vmd import (LINEAR_INTERPOLATION, BoneTrack, MorphTrack, bone_interpolation,
+                         merge_morphs, read_interpolation, read_vmd, thin_track, thin_weights,
+                         write_vmd)
 
 
 def test_roundtrip(tmp_path):
@@ -59,6 +61,56 @@ def test_long_bone_name_warns(tmp_path):
                   np.tile(quat.IDENTITY, (2, 1)))
     with pytest.warns(UserWarning):
         write_vmd(tmp_path / 'long.vmd', [t])
+
+
+def _center(n=3):
+    return BoneTrack('センター', np.arange(n), np.zeros((n, 3)), np.tile(quat.IDENTITY, (n, 1)))
+
+
+def test_morph_roundtrip(tmp_path):
+    morphs = [MorphTrack('まばたき', np.array([0, 5]), np.array([0.0, 1.0])),
+              MorphTrack('あ', np.array([0, 1, 2]), np.array([0.25, 0.5, 0.0]))]
+    path = tmp_path / 'm.vmd'
+    n_keys = write_vmd(path, [_center()], 'モデル', morphs=morphs)
+    assert n_keys == 3 + 5
+    assert len(path.read_bytes()) == 30 + 20 + 4 + 111 * 3 + 4 + 23 * 5 + 12
+    vmd = read_vmd(path)
+    assert vmd.morph_names() == sorted(['まばたき', 'あ'])
+    assert vmd.counts == dict(morph=5, camera=0, light=0, self_shadow=0)
+    for t in morphs:
+        frames, weights = vmd.morph_track(t.name)
+        np.testing.assert_array_equal(frames, t.frames)
+        np.testing.assert_allclose(weights, t.weights, atol=1e-7)
+
+
+def test_merge_morphs_keeps_bones_other_morphs_and_camera(tmp_path):
+    src = tmp_path / 'src.vmd'
+    write_vmd(src, [_center()], 'モデル', morphs=[
+        MorphTrack('まばたき', np.array([0, 5]), np.array([0.0, 1.0])),
+        MorphTrack('あ', np.array([0, 1]), np.array([0.5, 0.5]))])
+    # カメラのキーを 1 つ持つファイルにする（モーフより後ろはそのまま写すこと）
+    tail = struct.pack('<I', 1) + bytes(range(61)) + struct.pack('<2I', 0, 0)
+    src.write_bytes(src.read_bytes()[:-12] + tail)
+    out = tmp_path / 'merged.vmd'
+    merge_morphs(src, [MorphTrack('あ', np.array([0, 10, 20]), np.array([0.0, 0.8, 0.0]))], out)
+
+    before, after = read_vmd(src), read_vmd(out)
+    assert after.model_name == 'モデル'
+    np.testing.assert_array_equal(after.keys, before.keys)
+    frames, weights = after.morph_track('あ')        # 同じ名前のモーフは置き換わる
+    np.testing.assert_array_equal(frames, [0, 10, 20])
+    np.testing.assert_allclose(weights, [0.0, 0.8, 0.0], atol=1e-7)
+    np.testing.assert_array_equal(after.morph_track('まばたき')[0], [0, 5])   # ほかのモーフは残る
+    assert after.counts == dict(morph=5, camera=1, light=0, self_shadow=0)
+    assert out.read_bytes().endswith(tail)
+
+
+def test_thin_weights_accuracy():
+    t = np.arange(300)
+    w = np.clip(np.sin(t / 7.0) * 1.2, 0.0, 1.0)
+    keep = thin_weights(w, 0.01, forced=[100])
+    assert keep[[0, 100, len(t) - 1]].all() and keep.sum() < len(t) / 2
+    np.testing.assert_allclose(np.interp(t, t[keep], w[keep]), w, atol=0.01 + 1e-9)
 
 
 def test_thinning_keeps_forced_frames_and_accuracy():
