@@ -41,12 +41,16 @@ SIDES = ('左', '右')
 
 
 class Skeleton:
-    def __init__(self, positions, parents, tails, model_name='', source='standard'):
+    def __init__(self, positions, parents, tails, model_name='', source='standard',
+                 mesh_points=None, mesh_bones=None):
         self.positions = {k: np.asarray(v, np.float64) for k, v in positions.items()}
         self.parents = dict(parents)
         self.tails = {k: np.asarray(v, np.float64) for k, v in tails.items() if v is not None}
         self.model_name = model_name
         self.source = source
+        # PMX の頂点（MMD 座標）と、そのウェイトが最も大きいボーンの名前。標準ボーンでは None
+        self.mesh_points = mesh_points
+        self.mesh_bones = mesh_bones
 
     @classmethod
     def standard(cls):
@@ -68,7 +72,13 @@ class Skeleton:
                     tails[b.name] = model.bones[b.tail_index].position
             elif np.linalg.norm(b.tail_offset) > 1e-6:
                 tails[b.name] = b.position + b.tail_offset
-        return cls(pos, par, tails, model.name, 'pmx')
+        points = bones = None
+        if model.vertices is not None and len(model.vertices):
+            names = np.array([b.name for b in model.bones] + [''])
+            idx = np.asarray(model.vertex_bones)
+            bones = names[np.where((idx >= 0) & (idx < len(model.bones)), idx, len(model.bones))]
+            points = np.asarray(model.vertices, np.float64)
+        return cls(pos, par, tails, model.name, 'pmx', points, bones)
 
     def has(self, name):
         return name in self.positions

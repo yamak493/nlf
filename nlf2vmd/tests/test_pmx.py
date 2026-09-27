@@ -32,20 +32,28 @@ def make_morphs(morphs, enc=0, bsize=2):
     return out
 
 
-def make_pmx(bones, enc=0, bsize=2, n_uv=1):
-    """最小限の PMX 2.0。bones: [(名前, 位置, 親の番号, 表示先の番号 or None, IK か)]"""
+# 既定の頂点: 原点に BDEF1 / BDEF2 / BDEF4 / SDEF を 1 つずつ（ウェイトが最も大きいボーンはどれも 0 番）
+DEFAULT_VERTICES = [((0.0, 0.0, 0.0), 0, (0,), ()), ((0.0, 0.0, 0.0), 1, (0, 1), (0.5,)),
+                    ((0.0, 0.0, 0.0), 2, (0, 1, 0, 1), (0.25,) * 4),
+                    ((0.0, 0.0, 0.0), 3, (0, 1), (0.5,))]
+
+
+def make_pmx(bones, enc=0, bsize=2, n_uv=1, vertices=None):
+    """最小限の PMX 2.0。bones: [(名前, 位置, 親の番号, 表示先の番号 or None, IK か)]
+    vertices: [(位置, 変形方式 0〜3, ボーンの番号, ウェイト)]（3 つ以上。既定は DEFAULT_VERTICES）"""
     out = b'PMX ' + struct.pack('<f', 2.0) + bytes([8, enc, n_uv, 2, 1, 1, bsize, 1, 1])
     out += _text('テストモデル', enc) + _text('test', enc) + _text('', enc) + _text('', enc)
     bi = {1: 'b', 2: 'h', 4: 'i'}[bsize]
     verts = b''
-    for kind in (0, 1, 2, 3):   # BDEF1 / BDEF2 / BDEF4 / SDEF
-        verts += struct.pack(f'<{8 + 4 * n_uv}f', *[0.0] * (8 + 4 * n_uv)) + bytes([kind])
-        verts += {0: struct.pack(f'<{bi}', 0),
-                  1: struct.pack(f'<2{bi}f', 0, 1, 0.5),
-                  2: struct.pack(f'<4{bi}4f', 0, 1, 0, 1, 0.25, 0.25, 0.25, 0.25),
-                  3: struct.pack(f'<2{bi}10f', 0, 1, 0.5, *[0.0] * 9)}[kind]
+    vertices = DEFAULT_VERTICES if vertices is None else vertices
+    for pos, kind, bone_ids, weights in vertices:   # BDEF1 / BDEF2 / BDEF4 / SDEF
+        verts += struct.pack('<3f', *pos)
+        verts += struct.pack(f'<{5 + 4 * n_uv}f', *[0.0] * (5 + 4 * n_uv)) + bytes([kind])
+        verts += struct.pack(f'<{len(bone_ids)}{bi}{len(weights)}f', *bone_ids, *weights)
+        if kind == 3:
+            verts += struct.pack('<9f', *[0.0] * 9)
         verts += struct.pack('<f', 1.0)
-    out += struct.pack('<i', 4) + verts
+    out += struct.pack('<i', len(vertices)) + verts
     out += struct.pack('<i', 3) + struct.pack('<3H', 0, 1, 2)
     out += struct.pack('<i', 1) + _text('tex.png', enc)
     out += struct.pack('<i', 1) + _text('材質', enc) + _text('mat', enc)

@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from . import diagnostics, quat
+from .arm_collision import MODE_LABELS, OVERLAP_TOL_M, resolve_arm_collisions
 from .body_model import ANKLES, BodyModel, compute_kinematics, rest_info
 from .center import ReachGeometry, stabilize_center
 from .config import Config, load_config
@@ -57,6 +58,7 @@ class ConversionResult:
     depth: object = None
     ground: object = None
     lean: object = None
+    arm_collision: object = None   # ステージ9a（腕どうしの貫通の防止）の結果
     skeleton: object = None      # 対象モデルの骨格（variants.py で種類別のキーを作り直すのに使う）
     retargeter: object = None
 
@@ -282,6 +284,16 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     # ---- 9. 上半身の回転リターゲット ----
     local = rt.local_quats(kin.glob_rot)
 
+    # ---- 9a. 腕どうしの貫通の防止 ----
+    local, arms = resolve_arm_collisions(skel, rt, kin.glob_rot, local, cfg.arm_collision, k, fps)
+    n_before, n_after = arms.overlap_frames(OVERLAP_TOL_M * k)
+    radius_cm = ' / '.join(f'{n} {r:.1f}' for n, r in zip(('上腕', '前腕', '手'),
+                                                         arms.radius.mean(0) / k * 100.0))
+    log(f'[9a] 腕どうしの貫通の防止（{MODE_LABELS[arms.mode]}）: 腕の半径 {radius_cm} cm'
+        f'（{"PMX のメッシュから" if arms.radius_source == "mesh" else "設定の値"}）/ '
+        f'重なり {n_before} → {n_after} フレーム'
+        + (f' / 補正 最大 {arms.correction_deg.max(initial=0.0):.1f} 度' if arms.side >= 0 else ''))
+
     # ---- 10. VMD 書き出しと診断出力 ----
     tracks = build_tracks(skel, center.delta, ik, local, contact, cfg.vmd, k)
     model_name = cfg.vmd.model_name or skel.model_name or 'nlf2vmd'
@@ -295,7 +307,8 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     result = ConversionResult(
         str(out_path or ''), n_keys, cfg, fps, k, motion, quats, kin, kin_raw, floor, contact,
         ik, center, ankle_rest, geom, rt.global_matrix('下半身', kin_raw.glob_rot), local, tracks,
-        warnings=warns, depth=depth, ground=ground, lean=lean, skeleton=skel, retargeter=rt)
+        warnings=warns, depth=depth, ground=ground, lean=lean, arm_collision=arms, skeleton=skel,
+        retargeter=rt)
     result.info = dict(
         frames=motion.num_frames, fps=fps, source_fps=motion.source_fps, scale=k,
         smpl_leg_length_m=smpl_leg, mmd_leg_length=skel.mean_leg_length(),
@@ -334,6 +347,13 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
                         cfg.ground.max_flight_sec),
                     jumps_sec=[[round(s0 / fps, 2), round((e0 + 1) / fps, 2)]
                                for s0, e0 in runs(ground.flight)]),
+        arm_collision=dict(mode=arms.mode, radius_source=arms.radius_source,
+                           radius_cm=dict(zip(SIDES, (arms.radius / k * 100.0).tolist())),
+                           overlap_frames=dict(before=n_before, after=n_after),
+                           max_depth_cm={key: float(d.max(initial=0.0) / k * 100.0) for key, d in
+                                         (('before', arms.depth_before),
+                                          ('after', arms.depth_after))},
+                           max_correction_deg=float(arms.correction_deg.max(initial=0.0))),
         warnings=warns)
 
     if cfg.diagnostics.enabled:

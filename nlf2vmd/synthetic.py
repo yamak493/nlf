@@ -222,3 +222,32 @@ def add_joint_noise(motion, degrees, smooth_frames=3.0, seed=0):
         w = gaussian_filter1d(rng.normal(0.0, 1.0, (T, 3)), smooth_frames, axis=0)
         q[:, j] = quat.mul(q[:, j], quat.from_rotvec(np.deg2rad(deg) * w / w.std()))
     return dict(motion, pose=quat.to_rotvec(q))
+
+
+def add_arm_cross(motion, left_depth=0.0, right_depth=0.0):
+    """両腕を胸の前で交差させる（上腕を前下へ下ろし、前腕を反対側へ向けて、左右の前腕が同じ奥行きで交わる）。
+
+    left_depth / right_depth [m]（スカラーか (T,)）は、その腕の前腕全体（ひじと前腕の先）を体の前（+Z）へ
+    ずらす量。推定の腕どうしの前後の距離（通り抜け）を作るのに使う。synthetic_walk の出力のように、背骨と鎖骨の
+    回転が 0 のモーションに使う（腕の向きは体の向き（骨盤の回転）に対して決める）。
+    """
+    J = SMPL_REST_JOINTS
+    q = quat.from_rotvec(np.asarray(motion['pose'], float))
+    T = len(q)
+    for side, depth in enumerate((left_depth, right_depth)):
+        sign = 1.0 if side == 0 else -1.0
+        shoulder, elbow, wrist = 16 + side, 18 + side, 20 + side
+        upper = np.linalg.norm(J[elbow] - J[shoulder])
+        down = np.array([0.1 * sign, -0.7, 0.7])
+        shift = np.zeros((T, 3))
+        shift[:, 2] = np.broadcast_to(np.asarray(depth, float), (T,))
+        elbow_target = J[shoulder] + upper * down / np.linalg.norm(down) + shift
+        hand_target = np.array([-0.1 * sign, 0.08, 0.26]) + shift
+        for t in range(T):
+            g_upper = quat.from_two_vectors(J[elbow] - J[shoulder], elbow_target[t] - J[shoulder])
+            elbow_pos = J[shoulder] + quat.rotate(g_upper, J[elbow] - J[shoulder])
+            g_fore = quat.from_two_vectors(J[wrist] - J[elbow], hand_target[t] - elbow_pos)
+            q[t, shoulder] = g_upper
+            q[t, elbow] = quat.mul(quat.conj(g_upper), g_fore)
+        q[:, wrist] = quat.IDENTITY
+    return dict(motion, pose=quat.to_rotvec(q))

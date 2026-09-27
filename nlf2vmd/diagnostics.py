@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .arm_collision import OVERLAP_TOL_M
 from .body_model import ANKLES
 from .ground import floating_frames, lowest_foot_height
 from .jitter import JOINT_GROUPS, angular_acceleration
@@ -25,6 +26,8 @@ METRIC_LABELS = {
         'Z（奥行き）が X と同程度まで減少'),
     'lean_deg': ('前後の傾き', '接地している足の支持点の中心から全身の重心への線の、カメラの奥行き方向の傾きの中央値'
                  '（度。+ はカメラへ近づく向き。処理前はステージ6cの補正前の姿勢）', '0 に近い'),
+    'arm_overlap_frames': ('腕の重なり', '左右の腕のカプセル（上腕・前腕・手）が 5mm より深く重なっているフレーム数'
+                           '（処理前はステージ9aの前）', '0（arm_collision.mode: none では処理前と同じ）'),
 }
 
 
@@ -142,6 +145,9 @@ def compute_metrics(r):
     if r.lean is not None and r.lean.enabled:
         m['lean_deg'] = dict(before=float(np.nanmedian(r.lean.before_deg)),
                              after=float(np.nanmedian(r.lean.after_deg)))
+    if r.arm_collision is not None:
+        before, after = r.arm_collision.overlap_frames(OVERLAP_TOL_M * k)
+        m['arm_overlap_frames'] = dict(before=before, after=after)
     for key, (label, definition, goal) in METRIC_LABELS.items():
         if key in m:
             m[key].update(label=label, definition=definition, goal=goal)
@@ -164,7 +170,8 @@ def format_metrics(metrics):
     units = {'foot_slide_cm_per_frame': ' cm/フレーム', 'center_jitter_cm_per_frame2':
              ' cm/フレーム²（X, Y, Z）', 'pose_jitter_deg_per_s2': ' deg/s²',
              'foot_motion_near_floor_cm_per_frame': ' cm/フレーム（X, Z）',
-             'floating_frames': ' フレーム', 'hover_frames': ' フレーム', 'lean_deg': ' 度'}
+             'floating_frames': ' フレーム', 'hover_frames': ' フレーム', 'lean_deg': ' 度',
+             'arm_overlap_frames': ' フレーム'}
     lines = []
     for key, m in metrics.items():
         before = fmt(m['before']) if 'before' in m else '-'
@@ -307,6 +314,39 @@ def save_plots(r, out_dir):
         fig.tight_layout()
         paths['lean'] = out_dir / 'lean.png'
         fig.savefig(paths['lean'], dpi=110)
+
+    # 2e. 腕どうしの貫通の防止（左右の腕のカプセルの重なりと、自重する腕に掛けた補正角）
+    if r.arm_collision is not None:
+        a = r.arm_collision
+        fig = Figure(figsize=(12, 4))
+        ax = fig.subplots()
+        tol = OVERLAP_TOL_M * 100.0
+        top = max(tol, 1.1 * float(a.depth_before.max(initial=0.0)) * cm)
+        ax.axhspan(tol, top, color='tab:red', alpha=0.08, lw=0)
+        ax.plot(frames, a.depth_before * cm, color='0.6', lw=1, label='overlap depth: before')
+        ax.plot(frames, a.depth_after * cm, color='tab:red', lw=1.2, label='overlap depth: after')
+        ax.axhline(0.0, color='k', lw=0.6)
+        ax.set_ylabel('overlap depth [cm] (< 0: apart)')
+        ax.set_ylim(bottom=max(-20.0, float(min(a.depth_before.min(initial=0.0),
+                                                a.depth_after.min(initial=0.0))) * cm))
+        ax2 = ax.twinx()
+        ax2.plot(frames, a.correction_deg, color='tab:purple', lw=1.2, label='correction of the '
+                 'yielding arm [deg]')
+        ax2.set_ylabel('correction [deg]')
+        ax2.set_ylim(0.0, max(10.0, 1.2 * float(a.correction_deg.max(initial=0.0))))
+        before, after = a.overlap_frames(OVERLAP_TOL_M * k)
+        radius = a.radius.mean(0) * cm
+        yields = {0: 'left arm yields', 1: 'right arm yields'}.get(a.side, 'no correction')
+        ax.set_title(f'arm collision ({yields}): overlapping frames {before} -> {after}; '
+                     f'radius upper / fore / hand '
+                     f'{radius[0]:.1f} / {radius[1]:.1f} / {radius[2]:.1f} cm ({a.radius_source})',
+                     fontsize=10)
+        ax.set_xlabel('frame')
+        lines = ax.get_lines()[:2] + ax2.get_lines()[:1]
+        ax.legend(lines, [ln.get_label() for ln in lines], loc='upper right', fontsize=8)
+        fig.tight_layout()
+        paths['arm_collision'] = out_dir / 'arm_collision.png'
+        fig.savefig(paths['arm_collision'], dpi=110)
 
     # 3. 届く高さへのクランプの補正量
     fig = Figure(figsize=(12, 3.5))

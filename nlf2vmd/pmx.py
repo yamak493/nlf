@@ -1,6 +1,7 @@
 """PMX（2.0 / 2.1）の読み込み。変換に必要なボーン情報と、モーフの名前だけを取り出す。
 
-頂点・面・テクスチャ・材質は読み飛ばす（ボーンはそれらの後ろに並んでいるため）。
+頂点は位置と、ウェイトが最も大きいボーンだけを読む（腕の太さを測るのに使う）。
+面・テクスチャ・材質は読み飛ばす（ボーンはそれらの後ろに並んでいるため）。
 モーフ（口パクのキーを打つ先があるかの確認に使う）はボーンの後ろにある。
 """
 import struct
@@ -34,6 +35,8 @@ class PmxModel:
     name_en: str
     bones: list
     morphs: list = field(default_factory=list)   # 読めなかったときは None
+    vertices: np.ndarray = None       # (N, 3) 頂点の位置（MMD 座標）
+    vertex_bones: np.ndarray = None   # (N,) 頂点のウェイトが最も大きいボーンの番号
 
     def bone_index(self, name):
         for i, b in enumerate(self.bones):
@@ -96,21 +99,29 @@ def read_pmx(path):
     name, name_en = text(), text()
     text(), text()   # コメント
 
-    # ---- 頂点 ----
+    # ---- 頂点（位置と、ウェイトが最も大きいボーン） ----
+    bi = {1: 'b', 2: 'h', 4: 'i'}[bsize]
+    positions, owners = [], []
     for _ in range(r.i32()):
-        r.skip(4 * (3 + 3 + 2 + 4 * n_uv))
+        positions.append(r.unpack('3f'))
+        r.skip(4 * (3 + 2 + 4 * n_uv))
         kind = r.u8()
         if kind == 0:        # BDEF1
-            r.skip(bsize)
-        elif kind == 1:      # BDEF2
-            r.skip(2 * bsize + 4)
+            owners.append(r.index(bsize))
+        elif kind in (1, 3):  # BDEF2 / SDEF（ウェイトは 1 本目のボーンの分）
+            b0, b1, w = r.unpack(f'2{bi}f')
+            owners.append(b0 if w >= 0.5 else b1)
+            if kind == 3:
+                r.skip(36)
         elif kind in (2, 4):  # BDEF4 / QDEF
-            r.skip(4 * bsize + 16)
-        elif kind == 3:      # SDEF
-            r.skip(2 * bsize + 4 + 36)
+            v = r.unpack(f'4{bi}4f')
+            w = v[4:]
+            owners.append(v[w.index(max(w))])
         else:
             raise ValueError(f'未知のウェイト変形方式です: {kind}')
         r.skip(4)            # エッジ倍率
+    vertices = np.array(positions, np.float64).reshape(-1, 3)
+    vertex_bones = np.array(owners, np.int64)
     # ---- 面・テクスチャ ----
     r.skip(r.i32() * vsize)
     for _ in range(r.i32()):
@@ -172,4 +183,4 @@ def read_pmx(path):
                 morphs.append(PmxMorph(mname, mname_en, panel, kind))
         except (ValueError, struct.error):
             morphs = None
-    return PmxModel(name, name_en, bones, morphs)
+    return PmxModel(name, name_en, bones, morphs, vertices, vertex_bones)
