@@ -191,3 +191,75 @@ lipsync:
   fallback_vowel: a         # 母音が 1 つも認識されなかった声の区間の口の形（a / i / u / e / o。null で口を動かさない）
   smooth_sec: 0.03          # 形の切り替え・開き具合の変化をならすガウシアンの σ [秒]
   thin_tolerance: 0.01      # キーの間引き: 線形補間との差がこれ以内なら省く（0 で全フレームにキー）
+
+# ---- 手の形（指）: ノートブックのセル 16a / python -m nlf2vmd.hands ----
+# MediaPipe Hands の手のランドマーク（21 点）から指ごとの曲げを測り、手の形（下の presets の 9 種）に分けて、
+# 形ごとに決めた指の角度を指ボーンのキーにする。キーは形が変わる所だけに打つ。
+hands:
+  sides: both               # キーを打つ手: both | left | right
+  min_presence: 0.5         # 手の存在スコアがこれ未満のフレームは、手が見えない（袖・体に隠れた・画面外）とみなす
+  landmarks: screen         # 曲げを測る座標: screen（画像上の位置＋奥行き。小さく写った手ではこちらが安定）| world（3D [m]）
+  # 人差し指〜小指: 付け根・第 2・第 3 関節の曲げ角の和で、伸び / 中間（軽く曲げた）/ 曲げ に分ける
+  extended_below_deg: 65.0  # 和がこれより小さければ「伸び」
+  curled_above_deg: 110.0   # 和がこれより大きければ「曲げ」（間は中間。中間の指がある手はデフォルトになりやすい）
+  softness_deg: 25.0        # しきい値のまわりのあいまいさ（大きいほど中間の形がデフォルトになりやすい）
+  # 親指: MCP・IP の曲げ角の和が小さく、かつ指先が人差し指・中指の付け根側から離れていれば「伸び」
+  thumb_extended_below_deg: 50.0
+  thumb_softness_deg: 20.0
+  thumb_away: 0.6           # 親指の先と人差し指・中指の MCP・PIP の最短距離 ÷ 手のひらの幅（人差し指〜小指の付け根）
+  thumb_away_softness: 0.2
+  default_score: 0.5        # デフォルト（どの形にもはっきり当てはまらない手）の点。形の点は指ごとの確率の幾何平均（0〜1）
+  smooth_sec: 0.1           # 形の点を時間方向にならすガウシアンの σ [秒]
+  switch_cost: 3.0          # 形を切り替える重さ（点の対数の和で）。大きいほど、はっきり・長く続いた変化でしか切り替わらない
+  min_hold_sec: 0.25        # これより短く続く形は前後の形にまとめる（ちらつき防止）
+  max_gap_sec: 0.5          # 手が見えない区間がこれ以下なら、前後の形を続ける
+  missing_shape: default    # それより長く手が見えない区間の形: default | hold（直前の形のまま）
+  transition_sec: 0.15      # 形を切り替える時間（2 つのキーの間。補間はイーズイン・アウト）
+  bones:                    # 指ボーンの名前（左・右は自動で付ける）。モデルに無いボーンはキーを打たない
+    thumb: [親指０, 親指１, 親指２]
+    index: [人指１, 人指２, 人指３]
+    middle: [中指１, 中指２, 中指３]
+    ring: [薬指１, 薬指２, 薬指３]
+    pinky: [小指１, 小指２, 小指３]
+  # 形ごとの 5 本の指（親指・人差し指・中指・薬指・小指）の状態:
+  #   open（伸ばして開く）/ straight（伸ばす）/ relaxed（軽く曲げる）/ curled（握る）
+  presets:
+    default: [relaxed, relaxed, relaxed, relaxed, relaxed]
+    thumb: [straight, curled, curled, curled, curled]
+    index: [curled, straight, curled, curled, curled]
+    middle: [curled, curled, straight, curled, curled]
+    ring: [curled, curled, curled, straight, curled]
+    pinky: [curled, curled, curled, curled, straight]
+    fist: [curled, curled, curled, curled, curled]
+    scissors: [curled, open, open, curled, curled]
+    open: [open, open, open, open, open]
+  # 状態ごとの指の角度 [度]: [付け根の関節, 第 2 関節, 第 3 関節, 開き]
+  #   曲げは + で手のひら側へ。開きは付け根の関節を手のひらの面内で回す角度で、+ で親指側へ
+  #   親指の関節は 親指０・１・２（CMC・MCP・IP）。親指の曲げは手のひら側と小指側の間へ（thumb_across）
+  angles:
+    thumb:
+      open: [-12.0, 0.0, 0.0, 0.0]
+      straight: [0.0, 0.0, 0.0, 0.0]
+      relaxed: [8.0, 10.0, 10.0, 0.0]
+      curled: [5.0, 55.0, 55.0, 0.0]
+    index:
+      open: [0.0, 0.0, 0.0, 12.0]
+      straight: [0.0, 0.0, 0.0, 0.0]
+      relaxed: [12.0, 20.0, 12.0, 0.0]
+      curled: [80.0, 100.0, 65.0, 0.0]
+    middle:
+      open: [0.0, 0.0, 0.0, -6.0]
+      straight: [0.0, 0.0, 0.0, 0.0]
+      relaxed: [15.0, 22.0, 12.0, 0.0]
+      curled: [85.0, 100.0, 65.0, 0.0]
+    ring:
+      open: [0.0, 0.0, 0.0, -14.0]
+      straight: [0.0, 0.0, 0.0, 0.0]
+      relaxed: [18.0, 24.0, 14.0, 0.0]
+      curled: [88.0, 100.0, 65.0, 0.0]
+    pinky:
+      open: [0.0, 0.0, 0.0, -24.0]
+      straight: [0.0, 0.0, 0.0, 0.0]
+      relaxed: [22.0, 26.0, 16.0, 0.0]
+      curled: [90.0, 95.0, 60.0, 0.0]
+  thumb_across: [4.0, 3.0, 3.0]  # 親指０・１・２ の曲げの向き: 手のひら側へ 1 に対して、小指側へこの割合（大きいほど握った指の上を横切る）

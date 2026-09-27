@@ -18,7 +18,8 @@ Training code is provided for both PyTorch and TensorFlow.
 4. モーションを FBX（`motion.fbx`：スケルトン＋スキン付きマネキン＋アニメーション）でも書き出し、
 5. モーションを MMD 用の VMD に変換し（変換は [`nlf2vmd`](nlf2vmd/README.md)、仕様は [`vmd.md`](vmd.md)。GPU 不要のコマンドライン `python -m nlf2vmd` でも実行できます）、
 6. 動画の音声から [Demucs](https://github.com/adefossez/demucs) でボーカルを取り出し、[Allosaurus](https://github.com/xinjli/allosaurus) で母音を認識して、口のモーフ（「あ」「い」「う」「え」「お」「ん」）のキーを作り、
-7. VMD を **フル**（`motion_full.vmd`。既定）/ **フル [移動なし]** / **上半身のみ** / **表情のみ** から選んで書き出す
+7. 手首のまわりを切り出して [MediaPipe Hands](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker) で指の 21 点を求め、手の形（グー・チョキ・パー・指 1 本だけ など 9 種）を判定して指ボーンのキーを作り、
+8. VMD を **フル**（`motion_full.vmd`。既定）/ **フル [移動なし]** / **上半身のみ** / **表情のみ** から選んで書き出す
 
 という一連の処理を行う日本語ノートブックです。SMPL 公式ファイルが無くても動作します
 （[SMPLFitter](https://github.com/isarandi/smplfitter) は NLF の内部でも使われています）。

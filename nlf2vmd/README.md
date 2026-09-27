@@ -14,12 +14,14 @@ MikuMikuDance / MikuMikuMoving 用の VMD に変換します。仕様は [vmd.md
 * GPU も SMPL の公式ファイルも不要です（体モデルは NLF の TorchScript から書き出したものを使います）
 * 動画の音声から**口パク**（口のモーフ「あ」「い」「う」「え」「お」「ん」のキー）も作れます（`lipsync.py`。
   ボーカルの分離に Demucs、音素の認識に Allosaurus を使います。[口パク](#口パクリップシンク) を参照）
+* 動画から**手の形**（グー・チョキ・パー・指 1 本だけ など 9 種）を判定して、指ボーンのキーも作れます（`hands.py`・`hand_detect.py`。
+  指の 21 点の推定に MediaPipe Hands を使います。[手の形](#手の形指) を参照）
 
 ## 使い方
 
 ### ノートブックから
 
-`mp4_to_mannequin_ja.ipynb` のセル 14 で変換し、セル 16 で選んだ種類の VMD（既定は `nlf_mannequin/motion_full.vmd`）を
+`mp4_to_mannequin_ja.ipynb` のセル 14 で変換し、セル 17 で選んだ種類の VMD（既定は `nlf_mannequin/motion_full.vmd`）を
 書き出します（[出力の種類](#出力の種類)）。同じフォルダに、変換の入力 `motion_for_vmd.npz` と体モデル `smpl_body_model.npz` も保存されます。
 
 ### コマンドラインから
@@ -55,13 +57,16 @@ print(result.metrics['foot_slide_cm_per_frame'])   # {'before': ..., 'after': ..
 
 # 出力の種類を選んで書き出す（convert の出力先を None にすると、convert は VMD を書かない）
 from nlf2vmd import write_variant
+from nlf2vmd.hands import make_hands
 from nlf2vmd.lipsync import make_lipsync
 
 result = convert('motion_for_vmd.npz', None, pmx='モデル.pmx', diag_dir='vmd_diag')
 lip = make_lipsync('lipsync_analysis.npz', pmx='モデル.pmx')   # 口パク（任意）
-write_variant(result, 'full', 'motion_full.vmd', morphs=lip.tracks)
-write_variant(result, 'no_move', 'motion_full_no_move.vmd', morphs=lip.tracks)
-write_variant(result, 'upper_body', 'motion_upper_body.vmd')
+hand = make_hands('hands_analysis.npz', pmx='モデル.pmx',       # 手の形（任意）
+                  num_frames=len(result.contact.flags))
+write_variant(result, 'full', 'motion_full.vmd', morphs=lip.tracks, bones=hand.tracks)
+write_variant(result, 'no_move', 'motion_full_no_move.vmd', morphs=lip.tracks, bones=hand.tracks)
+write_variant(result, 'upper_body', 'motion_upper_body.vmd', bones=hand.tracks)
 write_variant(result, 'face', 'motion_face.vmd', morphs=lip.tracks)
 ```
 
@@ -96,13 +101,13 @@ PMX を指定しないときは、標準的な体格（身長 20 単位前後・
 
 ### 出力の種類
 
-`variants.py`（`write_variant`）で、変換結果から次の 4 種類を書き出せます。ノートブックではセル 16 で選びます（既定はフルのみ）。
+`variants.py`（`write_variant`）で、変換結果から次の 4 種類を書き出せます。ノートブックではセル 17 で選びます（既定はフルのみ）。
 
 | 種類 | `kind` | ノートブックのファイル | 内容 |
 |---|---|---|---|
-| フル | `full` | `motion_full.vmd` | 上の表のボーンすべて（`convert` の出力と同じ）＋口パク |
-| フル [移動なし] | `no_move` | `motion_full_no_move.vmd` | フルから体の水平移動を除いたもの＋口パク。センターの X・Z は 0 で、足はその場で足踏みする |
-| 上半身のみ | `upper_body` | `motion_upper_body.vmd` | 上半身・上半身2・首・頭・肩・腕・ひじ・手首の回転だけ。体全体の向きは除く |
+| フル | `full` | `motion_full.vmd` | 上の表のボーンすべて（`convert` の出力と同じ）＋口パク＋手の形（指ボーン） |
+| フル [移動なし] | `no_move` | `motion_full_no_move.vmd` | フルから体の水平移動を除いたもの＋口パク＋手の形。センターの X・Z は 0 で、足はその場で足踏みする |
+| 上半身のみ | `upper_body` | `motion_upper_body.vmd` | 上半身・上半身2・首・頭・肩・腕・ひじ・手首の回転と、手の形（指ボーン）だけ。体全体の向きは除く |
 | 表情のみ | `face` | `motion_face.vmd` | 口パクのモーフのキーだけ |
 
 * **フル [移動なし]**: 足ＩＫの水平位置を、足ごとに「足跡のずらし量」だけずらします。足が着いている間（足跡）はずらし量が一定
@@ -147,7 +152,7 @@ PMX を指定しないときは、標準的な体格（身長 20 単位前後・
    言語を `jpn` にすると日本語の音素だけで認識するので、母音がそのまま「あいうえお」に分かれる
 3. 認識結果（音素と時刻）とボーカルの音量を `lipsync_analysis.npz` に保存する
 
-セル 15a（または下のコマンド）が、`lipsync.py` で口のモーフのキーにします（ノートブックでは、セル 16 で選んだフル・フル [移動なし]・
+セル 15a（または下のコマンド）が、`lipsync.py` で口のモーフのキーにします（ノートブックでは、セル 17 で選んだフル・フル [移動なし]・
 表情のみの VMD に入れます）。
 
 * 母音はあ・い・う・え・お（IPA の母音を近い日本語の母音へ。唇を丸める母音は う・お へ）、両唇音 m・b・p と撥音 ɴ は ん（口を閉じる）。
@@ -182,6 +187,85 @@ PMX を指定すると、モデルに無いモーフ名は警告を出してキ�
 | 口の動きが声より早い / 遅い | `lipsync.lead_sec` を小さく / 大きく |
 | 口がパクパクしすぎる / 鈍い | `lipsync.smooth_sec` を大きく / 小さく |
 | 口がよく閉じる（ん が多い） | `lipsync.morphs.n: ''`（ん を使わない）か `lipsync.closed_weight` を小さく |
+
+## 手の形（指）
+
+ノートブックのセル 16 が、動画から左右の手の指の 21 点を求めます（`hand_detect.py`）。
+
+1. NLF の手首と手先の関節を画像に投影し、手首のまわりを MediaPipe と同じ形（手首→指の付け根が上を向く正方形）に切り出す
+2. [MediaPipe Hands](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker) の `hand_landmarker.task` に入っている
+   ランドマークモデル（`hand_landmarks_detector.tflite`）に、[LiteRT](https://ai.google.dev/edge/litert)（`ai-edge-litert`）で直接入れる。
+   1 回目の結果から MediaPipe のトラッキングと同じ方法で切り出しを作り直し、もう一度推定する
+3. 検出結果（画像上の 21 点・3D の 21 点・手の存在スコア）を `hands_analysis.npz` に保存する
+
+MediaPipe の HandLandmarker は、最初に画像全体から手のひらを探します。ダンス動画の手は小さく（数十 px）ぶれているので、
+これでは手がほとんど見つかりません（640px の動画の 30 秒で 1〜2 割）。体の関節から手の位置を決めてランドマークモデルに
+直接入れると、手が写っているフレームのほぼすべて（同じ動画で約 4 割。残りは袖・体に隠れた手）で推定できます。
+存在スコアの低い手と、体の手首から離れた所に見つかった手（もう一方の手など）は使いません。
+
+セル 16a（または下のコマンド）が、`hands.py` で指ボーンのキーにします（ノートブックでは、セル 17 で選んだフル・フル [移動なし]・
+上半身のみの VMD に入れます）。
+
+* **指ごとの判定**: 人差し指〜小指は付け根・第 2・第 3 関節の曲げ角の和（手首→付け根の向きに対する角度から）で、
+  `extended_below_deg` より小さいほど「伸び」、`curled_above_deg` より大きいほど「曲げ」、間は「中間」（軽く曲げた指）の確率にする。
+  親指は、MCP・IP の曲げが小さく、かつ指先が人差し指・中指の付け根側から離れているほど「伸び」（握った手の上に添えた親指を伸びとしない）。
+  曲げ角は画像上の点（＋奥行き）で測る（小さく写った手では、3D の点より画像上の点のほうが見た目と合う）
+* **手の形**: 次の 9 種。指のパターン（伸び / 曲げ / どちらでもよい）に合う度合いを、指ごとの確率の幾何平均で点にする。
+  デフォルトは一定の点 `default_score` で、どの形にもはっきり当てはまらない手（中間の指がある手など）はデフォルトになる
+
+| 形 | `SHAPES` | 親指・人差し指・中指・薬指・小指 |
+|---|---|---|
+| デフォルト | `default` | 軽く曲げる（ほかの形に当てはまらないとき） |
+| 親指だけ | `thumb` | 伸び・曲げ・曲げ・曲げ・曲げ |
+| 人差し指だけ | `index` | どちらでも・伸び・曲げ・曲げ・曲げ |
+| 中指だけ | `middle` | どちらでも・曲げ・伸び・曲げ・曲げ |
+| 薬指だけ | `ring` | どちらでも・曲げ・曲げ・伸び・曲げ |
+| 小指だけ | `pinky` | どちらでも・曲げ・曲げ・曲げ・伸び |
+| グー | `fist` | 曲げ・曲げ・曲げ・曲げ・曲げ |
+| チョキ | `scissors` | どちらでも・伸び・伸び・曲げ・曲げ（人差し指と中指を開く） |
+| パー | `open` | どちらでも・伸び・伸び・伸び・伸び（指を開く） |
+
+  （親指の判定がいちばん不安定なので、親指が形を決める 親指だけ・グー 以外では親指を見ない）
+* **時間方向**: 1 フレームごとのランドマークは、小さく写った手では大きくぶれる（同じ手の指の曲げが 1 フレームで 150 度変わることもある）。
+  そこで形の点を、手の見えているフレームだけでガウシアン（`smooth_sec`）でならし、形を切り替えるたびに `switch_cost` を引いたときに
+  全体で点（対数）の和がいちばん大きい形の並びを選ぶ（Viterbi）。はっきりした変化はすぐに、あいまいな変化は長く続いたときだけ切り替わる。
+  手が `max_gap_sec` より長く見えない区間はデフォルト（`missing_shape: hold` なら直前の形のまま）にし、`min_hold_sec` より短く続く形は
+  前後の形にまとめる。フレームレートが違えば、時刻がいちばん近い検出のフレームの形を使う
+* **指ボーンのキー**: 形ごとの指の状態（`presets`: open / straight / relaxed / curled）と、状態ごとの関節の角度（`angles`: 付け根・第 2・
+  第 3 関節の曲げと、付け根の開き）から、指ボーン（`bones`: 親指０〜２、人指・中指・薬指・小指の１〜３）のローカル回転を作る。
+  曲げの軸は、手首・人指１・小指１の位置から求めた手のひらの法線と、各指ボーンの向き（次のボーンか表示先への向き）に垂直な軸で、
+  + の角度で指先が手のひら側へ動く。親指は手のひら側と小指側の間へ曲げる（`thumb_across`）。開きは手のひらの面内の回転（+ で親指側）。
+  ボーンの位置だけから求めるので、モデルのローカル軸の設定に依らない。左右は鏡像になる
+* キーは形が変わる所だけに打つ。形が変わるフレームを中心に `transition_sec` かけて切り替え、始まりに前の形、終わりに次の形のキーを
+  打つ（終わりのキーの補間はイーズイン・アウト）。前後の形が短いときは、その長さの半分までに縮める
+* 判定した形は、区間を指定して手で直せる（`HAND_EDITS` / `--edit "12.0-13.5 右 チョキ"` / `make_hands(..., edits=[(12.0, 13.5, 'right', 'scissors')])`）。
+  `HandsResult.segments(手)` が判定した形の区間の一覧
+
+```bash
+# 保存した検出結果から、指だけの VMD と、体の動き＋指の VMD を作る（GPU・MediaPipe 不要）
+python -m nlf2vmd.hands hands_analysis.npz --pmx モデル.pmx -o hands.vmd --merge motion_full.vmd --plot hands.png
+
+# 設定を変える・形を手で直す（default_config.yaml の hands）
+python -m nlf2vmd.hands hands_analysis.npz --pmx モデル.pmx --merge motion_full.vmd \
+    --set hands.switch_cost=5 --set hands.sides=right --edit "12.0-13.5 右 チョキ"
+```
+
+| 出力 | 内容 |
+|---|---|
+| `hands.vmd` | 指ボーンのキーだけ。体のモーションを読み込んだあと、フレーム 0 で追加で読み込む |
+| `motion_full_hands.vmd`（`--merge` の出力） | 体の動きの VMD に指ボーンのキーを入れたもの（同じ名前のボーンのキーだけ置き換え、ほかのボーン・モーフ・カメラのキーは残す） |
+| `hands.png` | 左手・右手それぞれ: 上の帯 = 判定した形、線 = 指ごとの伸び（実線）・曲げ（点線）の確率（ならしたもの）、灰色 = 手が見えないフレーム |
+
+PMX が必要です（指ボーンの位置から曲げの軸を求めます）。モデルに無い指ボーンは警告を出してキーを打ちません
+（手首・人指１・小指１が無い手はキーを打ちません。`hands.bones` でボーン名を変えられます）。
+
+| 症状 | 調整する設定 |
+|---|---|
+| 手の形がすぐ変わる / ちらつく | `hands.switch_cost`・`hands.min_hold_sec` を大きく |
+| 手の形の変化が遅い・短い動きを拾わない | `hands.switch_cost`・`hands.min_hold_sec` を小さく |
+| デフォルトばかりになる | `hands.default_score` を小さく（0.3〜0.4）。`hands.png` が灰色ばかりなら手が見えていない（ノートブックのセル 16 の `HAND_ROI_M`） |
+| 軽く曲げた手がグー・パーになる | `hands.default_score` を大きく、`hands.softness_deg` を大きく |
+| 握り方・開き方がモデルに合わない | `hands.angles`・`hands.thumb_across` |
 
 ## 設定
 
@@ -228,6 +312,7 @@ MMD で見て問題があったときの調整の目安:
 | 10. VMD 書き出しと診断出力 | `vmd.py`、`diagnostics.py` |
 | 出力の種類（フル [移動なし]・上半身のみ など） | `variants.py` |
 | 口パク（リップシンク） | `lipsync.py`（モーフのキーの読み書き・合成は `vmd.py`、モデルのモーフ名は `pmx.py`） |
+| 手の形（指） | `hands.py`（形の判定・指ボーンの回転・キー。ボーンのキーの合成は `vmd.py`）、`hand_detect.py`（MediaPipe Hands のランドマークモデルでの検出。`ai-edge-litert` と `hand_landmarker.task` が必要） |
 
 全体の順番は `pipeline.py` の `convert` にあります。順番は入れ替えないでください（vmd.md 参照）。
 
@@ -281,4 +366,7 @@ python -m pytest nlf2vmd/tests
 接地中の足裏が床と平行）、PMX・体モデル・設定の読み込みを確認します。
 口パクは、合成した認識結果と音量で、音素の分類（Allosaurus の日本語・全言語の音素）、声が出ている間だけ口が動くこと、
 分離で残った伴奏を声としないこと、モーフのキーの読み戻し・体の動きの VMD との合成（ボーン・ほかのモーフ・カメラのキーが残る）を確認します。
-MMD での見た目の確認（足の滑り・埋まり・浮き・膝の暴れ・全身の震え・口の形）は手動で行ってください。
+手の形は、合成した 21 点の手で 9 種の形がどの向き・大きさでも正しく分かれること、1〜2 フレームの誤検出や短い隠れで形が変わらないこと、
+Black.pmx と同じ配置の指ボーンで、握ると指先が手のひら側へ動き（親指は小指側へも）、パーで指が開き、左右が鏡像になること、
+キー（切り替えの始まりと終わり・イーズの補間）と体の動きの VMD との合成を確認します。
+MMD での見た目の確認（足の滑り・埋まり・浮き・膝の暴れ・全身の震え・口の形・手の形）は手動で行ってください。

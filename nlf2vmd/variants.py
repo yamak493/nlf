@@ -1,7 +1,8 @@
 """出力する VMD の種類: フル / フル [移動なし] / 上半身のみ / 表情のみ。
 
 convert（pipeline.py）の結果から、種類ごとにボーンのキー列を作って書き出す。口パク（lipsync.py の
-MorphTrack）はどの種類にも足せる（ノートブックでは フル・フル [移動なし]・表情のみ に入れる）。
+MorphTrack）と手の形（hands.py の指ボーンの BoneTrack）はどの種類にも足せる（ノートブックでは、口パクは
+フル・フル [移動なし]・表情のみ に、手の形は フル・フル [移動なし]・上半身のみ に入れる）。
 
   full        センター・グルーブ・足ＩＫ・全身の回転（convert の結果そのまま）
   no_move     フルから体の水平移動（センターの X・Z）を除く。足ＩＫは、接地している間はその場に固定し
@@ -179,9 +180,16 @@ def variant_tracks(result, kind, log=print):
     return build_tracks(result.skeleton, center_delta, ik, result.local_quats, *args)
 
 
-def write_variant(result, kind, path, morphs=(), log=print):
-    """種類 kind の VMD を path に書き出す。morphs: 足すモーフのキー（MorphTrack のリスト）。戻り値はキーの総数。"""
+def write_variant(result, kind, path, morphs=(), bones=(), log=print):
+    """種類 kind の VMD を path に書き出す。戻り値はキーの総数。
+
+    morphs: 足すモーフのキー（MorphTrack のリスト。口パク）
+    bones: 足すボーンのキー（BoneTrack のリスト。hands.py の指など）。同じ名前のボーンは置き換える
+    """
     tracks = variant_tracks(result, kind, log)
+    if bones:
+        names = {t.name for t in bones}
+        tracks = [t for t in tracks if t.name not in names] + list(bones)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     return write_vmd(path, tracks, result.info.get('model_name') or 'nlf2vmd', morphs=morphs)

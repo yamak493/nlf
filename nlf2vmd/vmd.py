@@ -82,6 +82,7 @@ class BoneTrack:
     frames: np.ndarray       # (N,) int
     positions: np.ndarray    # (N, 3)
     rotations: np.ndarray    # (N, 4) x, y, z, w
+    interp: np.ndarray = None  # (N, 64) 補間パラメータ（前のキーからこのキーまでの曲線）。None なら線形
 
 
 @dataclass
@@ -109,7 +110,7 @@ def _bone_keys(tracks):
         keys['frame'][i:i + m] = np.asarray(t.frames, np.int64)
         keys['position'][i:i + m] = t.positions
         keys['rotation'][i:i + m] = t.rotations
-        keys['interp'][i:i + m] = LINEAR_INTERPOLATION
+        keys['interp'][i:i + m] = LINEAR_INTERPOLATION if t.interp is None else t.interp
         i += m
     return keys
 
@@ -214,6 +215,19 @@ def merge_morphs(src_path, morphs, out_path=None, model_name=None):
     kept = src.morph_keys[~np.isin(src.morph_keys['name'], list(names))]
     return _write_keys(out_path or src_path, src.model_name if model_name is None else model_name,
                        src.keys, np.concatenate([kept, _morph_keys(morphs)]), src.tail)
+
+
+def merge_bones(src_path, tracks, out_path=None, model_name=None):
+    """src_path の VMD に tracks（BoneTrack のリスト）のキーを足して out_path（既定は上書き）に書く。
+
+    同じ名前のボーンのキーが既にあれば置き換え、ほかのボーン・モーフ・カメラなどのキーはそのまま残す。
+    戻り値はキーの総数。
+    """
+    src = read_vmd(src_path)
+    names = {encode_name(t.name, 15) for t in tracks}
+    kept = src.keys[~np.isin(src.keys['name'], list(names))]
+    return _write_keys(out_path or src_path, src.model_name if model_name is None else model_name,
+                       np.concatenate([kept, _bone_keys(tracks)]), src.morph_keys, src.tail)
 
 
 # ---- キーの間引き（任意） ----
