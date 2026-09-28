@@ -18,8 +18,8 @@ Training code is provided for both PyTorch and TensorFlow.
 4. 手首のまわりを切り出して [MediaPipe Hands](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker) で指の 21 点を求め、手の形（グー・チョキ・パー・指 1 本だけ など 9 種）を判定して指ボーンのキーを作り、
 5. VMD を **フル**（`motion_full.vmd`。既定）/ **フル [移動なし]** / **上半身のみ** / **表情のみ** から選んで書き出す
 
-という一連の処理を行う日本語ノートブックです。SMPL 公式ファイルが無くても動作します
-（[SMPLFitter](https://github.com/isarandi/smplfitter) は NLF の内部でも使われています）。
+という一連の処理を行う日本語ノートブックです。出力は VMD だけです。SMPL の体モデルは NLF の TorchScript に入っているので、
+SMPL 公式ファイルが無くても動作します。
 
 ## Acknowledgments
 This work was supported by the German Federal Ministry of Education and Research (BMBF): Tübingen AI Center, FKZ: 01IS18039A. This work is funded by the Deutsche Forschungsgemeinschaft (DFG, German Research Foundation) – 409792180 (Emmy Noether Programme, project: Real Virtual Humans). GPM is a member of the Machine Learning Cluster of Excellence, EXC number 2064/1 –Project number 390727645. The project was made possible by funding from the Carl Zeiss Foundation.
