@@ -22,9 +22,11 @@ hand_detect.py はランドマークモデルに入れる前に、画像から R
     （ROI の戻し方が合っていること・3D の点と画像上の点が同じ手を表していることの確認）
   * 前腕に対する手首の曲げ・ひねりが、関節として無理のない範囲（max_swing_deg・max_twist_deg）
   * NLF の手首の向きとの差が max_disagree_deg 以内（既定の 180 度では使わない）
-存在スコアを重み（min_presence で 0、full_presence 以上で 1）にして、NLF の手首のローカル回転（前腕に対する回転）と球面線形補間する。見えない区間は、直前・直後に
-見えたときの手首のローカル回転を続け、重みを blend_sec のガウシアン（2σ で打ち切る）でならして NLF の向きへ戻す。最後に One Euro
-フィルタでならす（1 フレームごとの MediaPipe の推定はぶれるため）。
+存在スコアを重み（min_presence で 0、full_presence 以上で 1）にして、NLF の手首のローカル回転（前腕に対する回転）に掛ける
+補正（回転ベクトル。向きは時間方向に連続につなぐ）の割合にする。見えない区間は、前後に見えたときの手首のローカル回転を
+つなぎ、hold_sec 以下の区間は重みもつないで補正を保つ。それより長い区間は重みを blend_sec のガウシアン（2σ で打ち切る）で
+ならして NLF の向きへ戻す。補正の変わる速さは max_speed_deg_per_s までにし、最後に One Euro フィルタでならす
+（1 フレームごとの MediaPipe の推定はぶれるため）。
 """
 from dataclasses import dataclass, field
 
@@ -138,6 +140,50 @@ def _gap_fill(q, mask):
     return quat.slerp(q[prev], q[nxt], (t - prev) / span)
 
 
+def _bridge_gaps(w, mask, max_len):
+    """mask が False の区間のうち、前後に True があり長さが max_len フレーム以下のものの重みを、前後の重みの
+    直線補間で埋める（手が一瞬見えなくなるたびに NLF の向きへ戻って、また戻ってくる往復をしない）。"""
+    w = np.array(w, np.float64, copy=True)
+    for a, b in filters.runs(~mask):
+        if a == 0 or b == len(mask) - 1 or b - a + 1 > max_len:
+            continue
+        f = (np.arange(a, b + 1) - (a - 1)) / float(b - a + 2)
+        w[a:b + 1] = (1.0 - f) * w[a - 1] + f * w[b + 1]
+    return w
+
+
+def rate_limit(x, step):
+    """(T, 3) の列の 1 フレームの変化の大きさを step 以下にする。前向きと後ろ向きに掛けた結果の平均
+    （どちらも変化が step 以下なので平均も step 以下。片向きだけだと遅れる）。"""
+    def one_way(v):
+        y = np.array(v, np.float64, copy=True)
+        for t in range(1, len(y)):
+            d = y[t] - y[t - 1]
+            n = float(np.linalg.norm(d))
+            if n > step:
+                y[t] = y[t - 1] + d * (step / n)
+        return y
+    x = np.asarray(x, np.float64)
+    return 0.5 * (one_way(x) + one_way(x[::-1])[::-1])
+
+
+def continuous_rotvec(r):
+    """回転ベクトルの列 (T, 3) を、同じ回転のまま時間方向に連続にする（np.unwrap の回転版）。
+
+    180 度に近い回転は、逆向きの軸まわりの 360 − θ 度でも表せる。フレームごとに短いほう（θ ≤ 180 度）を
+    選ぶと、180 度をまたぐたびに向きが入れ替わる。前のフレームに近いほうを選ぶ。
+    """
+    r = np.array(r, np.float64, copy=True)
+    for t in range(1, len(r)):
+        a = float(np.linalg.norm(r[t]))
+        if a < 1e-9:
+            continue
+        alt = r[t] * (1.0 - 2.0 * np.pi / a)
+        if np.linalg.norm(alt - r[t - 1]) < np.linalg.norm(r[t] - r[t - 1]):
+            r[t] = alt
+    return r
+
+
 def observed_targets(analysis, rest_joints, cfg):
     """検出結果（hands.load_analysis の dict）から、フレームごとの手首の大域回転の目標（Y 上向き、(N, 2, 3, 3)）と、
     使えるか (N, 2)・重み (N, 2)・却下の理由ごとの数 dict。"""
@@ -212,21 +258,31 @@ def correct_wrists(quats, fk, rest_joints, analysis, fps, cfg):
         disagreement[usable[:, s], s] = diff[usable[:, s]]
         if not use.any():
             continue
-        w = np.where(use, weight[:, s], 0.0)
+        w = _bridge_gaps(np.where(use, weight[:, s], 0.0), use, int(round(float(cfg.hold_sec) * fps)))
         # カーネルは 2σ で打ち切る（見える区間から blend_sec の 2 倍より離れたフレームは NLF の向きのまま）
         sigma = float(cfg.blend_sec) * fps
         w = np.clip(filters.gaussian_time(w, sigma, radius=2.0 * sigma), 0.0, 1.0) \
             * float(cfg.strength)
         local_t = _gap_fill(local_t, use)
-        # ならすのは NLF の回転に掛ける補正（手首の座標系）のほう。回転そのものをならすと、重みが 0 になる境目で
-        # 「ならした NLF の回転」から「NLF の回転」へ 1 フレームで切り替わって跳ねる。補正なら境目では単位回転に近い
-        delta = quat.make_continuous(quat.mul(quat.conj(cur), quat.slerp(cur, local_t, w)))
+        # NLF の回転に掛ける補正（手首の座標系）を回転ベクトルにして、重みを掛ける。
+        # * 補正の向きは時間方向に連続にする。NLF と MediaPipe の向きが 180 度近く違う（手のひらの表裏を取り違えた
+        #   等）とき、球面線形補間は近いほうへ回るので、差が 180 度をまたぐたびに回す向きが入れ替わり、重みが 1 未満の
+        #   所で手首が 1 フレームに 90 度以上跳ねる（捩りボーンに分けると一瞬で 1 回転して見える）
+        # * ならすのも補正のほう。回転そのものをならすと、重みが 0 になる境目で「ならした NLF の回転」から
+        #   「NLF の回転」へ 1 フレームで切り替わって跳ねる。補正なら境目では 0 に近い
+        # * 補正の変わる速さは max_speed_deg_per_s まで（NLF と 180 度近く違うと、見える・見えないの境目の重みの
+        #   変化だけで手首が一瞬で半回転する）
+        r = continuous_rotvec(quat.to_rotvec(quat.mul(quat.conj(cur), local_t)))
+        d = w[:, None] * r
+        if float(cfg.max_speed_deg_per_s) > 0:
+            d = rate_limit(d, np.deg2rad(float(cfg.max_speed_deg_per_s)) / fps)
+        active = np.linalg.norm(d, axis=-1) > 1e-9
         sm = cfg.smooth
-        delta = quat.normalize(filters.one_euro(delta, fps, float(sm.min_cutoff), float(sm.beta),
-                                                float(sm.d_cutoff), True, vector_axis=-1))
-        q = quat.mul(cur, delta)
-        # 補正の届かないフレーム（重みが 0 の所）は、NLF の回転をそのまま残す
-        q = np.where((w > 1e-4)[:, None], q, cur)
+        d = filters.one_euro(d, fps, float(sm.min_cutoff), float(sm.beta), float(sm.d_cutoff), True,
+                             vector_axis=-1)
+        q = quat.mul(cur, quat.from_rotvec(d))
+        # 補正の届かないフレームは、NLF の回転をそのまま残す
+        q = np.where(active[:, None], q, cur)
         out[:, WRIST[s]] = quat.make_continuous(q)
         final_w[:, s] = w
         correction[:, s] = np.rad2deg(quat.angle_between(out[:, WRIST[s]], cur))

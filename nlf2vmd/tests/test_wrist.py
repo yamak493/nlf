@@ -6,8 +6,8 @@ from nlf2vmd import convert, load_config, quat
 from nlf2vmd.body_model import forward_kinematics
 from nlf2vmd.motion_io import CAMERA_TO_YUP
 from nlf2vmd.synthetic import SMPL_REST_JOINTS, synthetic_walk
-from nlf2vmd.wrist import (WRIST, correct_wrists, palm_frame, rest_palm_frames, ray_rotation,
-                           roi_rotation, swing_twist, world_to_camera)
+from nlf2vmd.wrist import (WRIST, continuous_rotvec, correct_wrists, palm_frame, rate_limit,
+                           rest_palm_frames, ray_rotation, roi_rotation, swing_twist, world_to_camera)
 
 IMAGE = (1280, 720)
 FPS = 30.0
@@ -121,9 +121,10 @@ def test_correct_wrists_recovers_the_palm_orientation(body_model):
     assert (_angles(fk, nlf, G_true)[15:45] > 140).all()      # NLF は 150 度ずれている
     assert (err[20:40] < 2.0).all()                           # 見えている区間は正しい向きに戻る
     assert (np.diff(err[10:20, 0]) < 1e-9).all()              # 見え始めは blend_sec かけて寄せる
-    # 見えない区間は、見える区間から blend_sec の 2 倍（6 フレーム）より離れると NLF の向きのまま
-    np.testing.assert_allclose(fixed[:3], nlf[:3])
-    np.testing.assert_allclose(fixed[-3:], nlf[-3:])
+    # 見えない区間は、見える区間から離れると NLF の向きのまま（blend_sec の 2 倍の 6 フレームに加えて、150 度の
+    # 補正を max_speed_deg_per_s（1 フレームに 12 度）で入れる分、前後に 2 フレームずつ広がる）
+    np.testing.assert_allclose(fixed[:2], nlf[:2])
+    np.testing.assert_allclose(fixed[-2:], nlf[-2:])
     for k in range(24):                                       # 変えるのは手首の関節だけ
         if k not in WRIST:
             np.testing.assert_allclose(fixed[:, k], nlf[:, k])
@@ -131,6 +132,71 @@ def test_correct_wrists_recovers_the_palm_orientation(body_model):
     assert res.info['left']['disagreement_deg_median'] > 140
     steps = np.rad2deg(quat.angle_between(fixed[1:, WRIST[0]], fixed[:-1, WRIST[0]]))
     assert steps.max() < 25.0                                 # 見える・見えないの境目でも跳ねない
+
+
+def test_continuous_rotvec_keeps_the_direction_across_180_degrees():
+    """178 度と 182 度（= 逆向きの 178 度）を行き来する回転を、同じ向きの回転ベクトルのままつなぐ。"""
+    axis = np.array([1.0, 0.0, 0.0])
+    deg = np.array([170.0, 178.0, 182.0, 179.0, 185.0, 176.0])
+    r = quat.to_rotvec(quat.from_rotvec(np.deg2rad(deg)[:, None] * axis))   # 180 度を超えると向きが反転する
+    assert (r @ axis < 0).any()
+    np.testing.assert_allclose(continuous_rotvec(r) @ axis, np.deg2rad(deg), atol=1e-9)
+    same = quat.angle_between(quat.from_rotvec(continuous_rotvec(r)), quat.from_rotvec(r))
+    assert same.max() < 1e-9                                   # 回転そのものは変えない
+
+
+def test_rate_limit_is_symmetric_and_bounded():
+    x = np.zeros((40, 3))
+    x[15:25, 0] = 1.0
+    y = rate_limit(x, 0.1)
+    assert np.linalg.norm(np.diff(y, axis=0), axis=-1).max() <= 0.1 + 1e-12
+    np.testing.assert_allclose(y[:20, 0], y[39:19:-1, 0], atol=1e-12)   # 前後対称（遅れない）
+
+
+@pytest.mark.parametrize('presence_value', [0.6, 0.95])
+def test_half_turn_disagreement_does_not_spin_the_wrist(body_model, presence_value):
+    """NLF が手首を前腕まわりに 180 度前後ひねり違えていても、1 フレームで大きく回らない。
+
+    球面線形補間は近いほうへ回るので、差が 180 度をまたぐたびに回す向きが入れ替わる（重みが 1 未満の所で
+    手首が 1 フレームに 90 度以上跳ね、捩りボーンに分けると一瞬で 1 回転して見えた）。
+    """
+    T = 90
+    rng = np.random.default_rng(0)
+    _, true, _ = _true_and_nlf(T)
+    fk, _ = _fk(body_model, T)
+    nlf = true.copy()
+    for s in range(2):
+        axis = (SMPL_REST_JOINTS[22 + s] - SMPL_REST_JOINTS[20 + s])
+        off = np.deg2rad(180.0 + rng.normal(0.0, 4.0, T))
+        nlf[:, WRIST[s]] = quat.mul(true[:, WRIST[s]],
+                                    quat.from_rotvec(off[:, None] * axis / np.linalg.norm(axis)))
+    presence = np.full((T, 2), presence_value)
+    a = _analysis(fk(true)[:, list(WRIST)], presence)
+    fixed, _ = correct_wrists(nlf, fk, SMPL_REST_JOINTS, a, FPS, load_config().wrist)
+    for s in range(2):
+        q = fixed[:, WRIST[s]]
+        assert np.rad2deg(quat.angle_between(q[1:], q[:-1])).max() < 20.0
+
+
+def test_short_dropouts_keep_the_correction(body_model):
+    """手が 0.3 秒見えなくなっても、NLF の（180 度近く違う）向きへ戻って往復しない。"""
+    T = 90
+    _, true, nlf = _true_and_nlf(T)
+    fk, _ = _fk(body_model, T)
+    G_true = fk(true)[:, list(WRIST)]
+    presence = np.full((T, 2), 0.95)
+    presence[40:49] = 0.0
+    cfg = load_config().wrist
+    fixed, _ = correct_wrists(nlf, fk, SMPL_REST_JOINTS, _analysis(G_true, presence), FPS, cfg)
+    assert _angles(fk, fixed, G_true)[40:49].max() < 5.0       # 見えない間も正しい向きのまま
+    steps = np.rad2deg(quat.angle_between(fixed[1:, WRIST[0]], fixed[:-1, WRIST[0]]))
+    assert steps.max() < cfg.max_speed_deg_per_s / FPS + 5.0
+    # つながない設定では NLF の向きへ戻る（補正の速さの上限で、ゆっくり）
+    off = load_config(overrides=['wrist.hold_sec=0']).wrist
+    fixed, _ = correct_wrists(nlf, fk, SMPL_REST_JOINTS, _analysis(G_true, presence), FPS, off)
+    assert _angles(fk, fixed, G_true)[44].min() > 45.0
+    steps = np.rad2deg(quat.angle_between(fixed[1:, WRIST[0]], fixed[:-1, WRIST[0]]))
+    assert steps.max() < off.max_speed_deg_per_s / FPS + 5.0
 
 
 @pytest.mark.parametrize('case', ['low_presence', 'inconsistent_2d', 'disagree_gate'])
