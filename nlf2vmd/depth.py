@@ -96,7 +96,7 @@ def detection_speeds(kin, axis, fps, unit, cfg):
     return np.minimum(horizontal_speed(by_root, fps), horizontal_speed(by_point, fps))
 
 
-def solve_depth(raw, rel, segments, fps, contact_sigma, prior_sigma, accel_sigma):
+def solve_depth(raw, rel, segments, fps, contact_sigma, prior_sigma, accel_sigma, prior_weights=None):
     """骨盤の奥行き r (T,) を重み付き最小二乗で求める（単位は m）。
 
     raw: (T,) 推定された骨盤の奥行き / rel: (T, 2) 足首の奥行き − 骨盤の奥行き（姿勢から求めたもの）
@@ -105,6 +105,7 @@ def solve_depth(raw, rel, segments, fps, contact_sigma, prior_sigma, accel_sigma
       接地:   (r_t + rel_t − L) / contact_sigma      （区間内の各フレーム）
       事前:   (r_t − raw_t) / prior_sigma
       加速度: (r_{t−1} − 2 r_t + r_{t+1}) / (accel_sigma / fps²)
+    prior_weights: (T,) 事前の項のフレームごとの重み（0 = そのフレームの推定を使わない）。None ならすべて 1
     """
     raw = np.asarray(raw, np.float64)
     T = len(raw)
@@ -120,7 +121,11 @@ def solve_depth(raw, rel, segments, fps, contact_sigma, prior_sigma, accel_sigma
         rhs.append(b)
 
     t = np.arange(T)
-    wp = 1.0 / prior_sigma
+    wp = np.full(T, 1.0 / prior_sigma)
+    if prior_weights is not None:
+        pw = np.asarray(prior_weights, np.float64)
+        if pw.max(initial=0.0) > 0.0:     # すべて 0 だと解が決まらないので、そのときは重みを使わない
+            wp = wp * pw
     add([(t, wp)], wp * raw)
     if T >= 3:
         wa = fps ** 2 / accel_sigma
@@ -140,7 +145,7 @@ def solve_depth(raw, rel, segments, fps, contact_sigma, prior_sigma, accel_sigma
     return np.asarray(x[:T])
 
 
-def reconstruct_depth(kin, kin_pose, contact, axis, fps, unit, cfg):
+def reconstruct_depth(kin, kin_pose, contact, axis, fps, unit, cfg, valid=None):
     """ステージ6b。kin: ステージ5の後（MMD 単位・床 y=0）/ contact: ステージ6の接地判定。
 
     kin_pose: 足首→骨盤の相対位置を求める姿勢。ステージ2で平滑化する前の姿勢を渡す（平滑化した姿勢では、
@@ -148,6 +153,8 @@ def reconstruct_depth(kin, kin_pose, contact, axis, fps, unit, cfg):
     骨盤が後ろへ引き戻され、歩いた距離が短くなる）。単独フレームの外れ値はメディアン（窓幅 5）で除く。
     メディアンは単調な変化（床に着いた足首に対して骨盤が進む動き）をそのまま残す。線形の平滑化は
     幅 1 フレームのガウシアンでも接地の前後に遊脚の動きが混ざるので掛けない（姿勢のぶれは加速度の項でならす）。
+    valid: (T,) bool 人物を検出できたフレーム。False のフレーム（前後から補間しただけ）の奥行きは事前の項に
+    使わず、接地している足と加速度の項だけでつなぐ。
     """
     raw = kin.root_pos @ axis
     if not cfg.reconstruct:
@@ -155,5 +162,6 @@ def reconstruct_depth(kin, kin_pose, contact, axis, fps, unit, cfg):
     rel = filters.median_time((kin_pose.joints[:, ANKLES] - kin_pose.root_pos[:, None]) @ axis, 5)
     depth = solve_depth(raw / unit, rel / unit, contact.segments, fps,
                         float(cfg.contact_sigma_m), float(cfg.prior_sigma_m),
-                        float(cfg.accel_sigma_m_per_s2)) * unit
+                        float(cfg.accel_sigma_m_per_s2),
+                        None if valid is None else np.asarray(valid, np.float64)) * unit
     return DepthResult(axis, raw, depth, True)

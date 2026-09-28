@@ -10,10 +10,11 @@ import numpy as np
 
 from . import diagnostics, quat
 from .arm_collision import MODE_LABELS, OVERLAP_TOL_M, resolve_arm_collisions
-from .body_model import ANKLES, BodyModel, compute_kinematics, rest_info
+from .body_model import ANKLES, BodyModel, compute_kinematics, forward_kinematics, rest_info
 from .center import ReachGeometry, stabilize_center
 from .config import Config, load_config
 from .contact import detect_contacts
+from .contacts import resolve_contacts
 from .depth import depth_axis, depth_jitter, detection_speeds, reconstruct_depth
 from .floor import estimate_floor
 from .filters import runs
@@ -25,7 +26,8 @@ from .motion_io import load_motion
 from .pmx import PmxModel, read_pmx
 from .retarget import Retargeter
 from .skeleton import REQUIRED_BONES, SIDES, Skeleton
-from .vmd import BoneTrack, thin_track, to_mmd_position, to_mmd_quat, write_vmd
+from .vmd import BoneTrack, sample_rotations, thin_track, to_mmd_position, to_mmd_quat, write_vmd
+from .wrist import correct_wrists
 
 BODY_MODEL_FILENAME = 'smpl_body_model.npz'
 
@@ -59,6 +61,10 @@ class ConversionResult:
     ground: object = None
     lean: object = None
     arm_collision: object = None   # ステージ9a（腕どうしの貫通の防止）の結果
+    wrist: object = None         # ステージ2b（手首の向きの補正）の結果
+    contacts: object = None      # ステージ9b（腕・手のひら・指先と体・相手の腕の接触）の結果
+    local_before_contacts: dict = None   # ステージ9b の前のローカル回転（指の形を入れて 9b をやり直すのに使う）
+    smpl_rest: np.ndarray = None  # SMPL の初期姿勢の関節（体型を固定したもの）
     skeleton: object = None      # 対象モデルの骨格（variants.py で種類別のキーを作り直すのに使う）
     retargeter: object = None
 
@@ -93,7 +99,7 @@ def resolve_body_model(body_model, source):
         return BodyModel.from_smplfitter()
     except Exception as e:
         raise RuntimeError(
-            'SMPL の体モデルが見つかりません。ノートブックのセル 14 で書き出した '
+            'SMPL の体モデルが見つかりません。ノートブックのセル 9 で書き出した '
             f'{BODY_MODEL_FILENAME} を --body-model で指定してください。') from e
 
 
@@ -142,8 +148,51 @@ def build_tracks(skel, center_delta, ik, local, contact, cfg_vmd, unit):
     return tracks
 
 
+def log_contacts(contacts, unit, log, label='[9b]'):
+    if log is None:
+        return
+    if not contacts.enabled:
+        log(f'{label} 腕・指と体の接触: 扱いません')
+        return
+    info = contacts.info
+    source = dict(rigid='PMX の剛体', mesh='PMX のメッシュ', config='標準の体格', none='なし')[
+        info['body_source']]
+    parts = ' / '.join(f'{k} {b}→{a}' for k, (b, a) in info['overlap_frames_by_part'].items()
+                       if b or a)
+    corr = info['max_correction_deg']
+    log(f'{label} 腕・指と体・相手の腕の接触（体の形: {source} {info["body_capsules"]} 個・'
+        f'{"指の各節まで" if info["fingers"] else "手は 1 本の棒"}）: 重なり '
+        f'{info["overlap_frames"]["before"]} → {info["overlap_frames"]["after"]} フレーム'
+        + (f'（{parts}）' if parts else '')
+        + f' / 補正 最大 肩 {corr["shoulder"]:.1f}・ひじ {corr["elbow"]:.1f}・手首 {corr["wrist"]:.1f} 度')
+
+
+def apply_hand_poses(result, hand_tracks, log=print):
+    """指のキー（hands.make_hands の tracks）を入れた指の形で、ステージ9b（接触の解決）をやり直す。
+
+    result（convert の結果）の local_quats・tracks・contacts を置き換える（ノートブックのセル 13 で、手の形のキーを作ったあとに
+    呼ぶ）。指のキーそのものは変えない。戻り値は ContactResult。
+    """
+    T = len(result.contact.flags)
+    cfg = result.config
+    # VMD の回転（MMD 座標）→ 内部座標（どちらの向きも同じ符号の反転）
+    finger_local = {t.name: quat.normalize(to_mmd_quat(sample_rotations(t, T)))
+                    for t in hand_tracks if len(t.frames)}
+    local, contacts = resolve_contacts(
+        result.skeleton, result.retargeter, result.kin.glob_rot, result.local_before_contacts,
+        cfg.contacts, cfg.arm_collision, cfg.hands.bones, cfg.arm_collision.mode, result.scale,
+        result.fps, result.smpl_rest, finger_local=finger_local)
+    result.local_quats = local
+    result.contacts = contacts
+    result.tracks = build_tracks(result.skeleton, result.center.delta, result.foot_ik, local,
+                                 result.contact, cfg.vmd, result.scale)
+    result.info['contacts'] = contacts.info
+    log_contacts(contacts, result.scale, log, label='[9b 指の形を入れて]')
+    return contacts
+
+
 def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=None,
-            diag_dir=None, log=print):
+            diag_dir=None, log=print, hands_analysis=None):
     """NLF のモーション（npz のパス、または pose / betas / trans / fps を持つ dict）を VMD に変換する。
 
     out_path: 書き出す .vmd（フル: 体の動きすべて）。None なら書き出さない（variants.write_variant で
@@ -151,6 +200,8 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     pmx: 対象モデルの .pmx（None なら標準ボーンの寸法）/ body_model: SMPL 体モデルの npz
     config: 設定ファイルのパス・dict・Config / overrides: ['center.mode=B', ...]
     diag_dir: 診断出力（JSON・PNG）の保存先。None なら <VMD 名>_diag/（out_path も None なら保存しない）
+    hands_analysis: 手のランドマークの検出結果（hands.save_analysis の npz のパスか dict）。渡すと、
+    ステージ2b で手首の向きを MediaPipe の手のひらの向きへ寄せる（フレーム 0 は source のフレーム 0 とそろえる）
     """
     cfg = config if isinstance(config, Config) and not overrides else load_config(config,
                                                                                   overrides)
@@ -182,6 +233,14 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     log(f'[1] 読み込み: {motion.num_frames} フレーム @ {fps:g} fps（元 {motion.source_fps:g} fps）')
     if abs(fps - 30.0) > 1e-6:
         warn(f'MMD は 30fps で再生します（出力は {fps:g}fps）。input.target_fps を 30 にしてください')
+    valid = np.asarray(motion.valid, bool)
+    gaps = runs(~valid)
+    longest_gap = max((e - s + 1 for s, e in gaps), default=0) / fps
+    if gaps:
+        log(f'    検出できなかった（前後から補間した）フレーム: {int((~valid).sum())} '
+            f'（{len(gaps)} 区間・最長 {longest_gap:.2f} 秒）。床・接地・奥行き・傾きの推定には使いません')
+        if longest_gap > float(cfg.input.max_gap_warn_sec):
+            warn(f'人物を検出できなかった区間が {longest_gap:.1f} 秒続いています（補間しただけの動きです）')
     if np.isfinite(motion.fk_check_mm):
         log(f'    体モデルの自己検証: 入力の関節との最大差 {motion.fk_check_mm:.2f} mm')
         if motion.fk_check_mm > 20.0:
@@ -192,6 +251,31 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     root = stabilize_root(motion.root_pos, cfg.jitter.root_median_window)
     log(f'[2] ジッター制御: 外れ値として置き換えたフレーム {jitter_info["outlier_frames"]}')
 
+    # ---- 2b. 手首の向きの補正（MediaPipe Hands） ----
+    wrist = None
+    if hands_analysis is not None and cfg.wrist.enabled:
+        from .hands import load_analysis
+        analysis = load_analysis(hands_analysis)
+        if 'roi' not in analysis or 'image_size' not in analysis:
+            warn('手の検出結果に ROI・画像の大きさが無いので、手首の向きは補正しません'
+                 '（ノートブックのセル 10 で検出し直してください）')
+        else:
+            rest_joints = bm.rest_joints(motion.betas)
+
+            def fk(q):
+                return forward_kinematics(q, root, rest_joints, bm.parents)[0]
+
+            quats, wrist = correct_wrists(quats, fk, rest_joints, analysis, fps, cfg.wrist)
+            parts = []
+            for s, name in zip(SIDES, ('left', 'right')):
+                d = wrist.info[name]
+                med = d['disagreement_deg_median']
+                parts.append(f'{s}手 使えたフレーム {d["observed_frames"]}'
+                             + ('' if med is None else
+                                f'・NLF との差の中央値 {med:.0f} 度'
+                                f'（45 度超 {d["disagreement_over_45_ratio"] * 100:.0f}%）'))
+            log('[2b] 手首の向きの補正（MediaPipe）: ' + ' / '.join(parts))
+
     # ---- 3. FK で関節位置・かかと・つま先を算出 ----
     rest = rest_info(bm, motion.betas, int(cfg.body.heel_toe_vertices),
                      float(cfg.body.sole_band_m))
@@ -199,7 +283,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     kin_raw = compute_kinematics(motion.quats, motion.root_pos, rest)   # 診断の「処理前」用
 
     # ---- 4. 床面推定と定数オフセット ----
-    floor = estimate_floor(kin, fps, cfg.floor, rest.points.mean(2))
+    floor = estimate_floor(kin, fps, cfg.floor, rest.points.mean(2), valid)
     kin, kin_raw = floor.apply(kin), floor.apply(kin_raw)
     log(f'[4] 床: 傾き {floor.tilt_deg:.1f} 度（'
         + {'full': '補正済み', 'line': '1 方向だけ補正', 'none': '補正なし'}[floor.tilt_mode]
@@ -228,18 +312,19 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     # 前後の傾きは 1 回目の接地判定のあとに 1 度だけ求める。足首から下は動かさないので接地判定は変わらず、
     # 奥行きの再構成は傾きを補正した足首→骨盤の相対位置を使う（平滑化する前の姿勢にも同じ補正を掛ける）
     axis = depth_axis(floor.rotation)
-    ground = ground_offset(kin, fps, k, cfg.ground)
+    ground = ground_offset(kin, fps, k, cfg.ground, valid)
     judged = ground.apply(kin)
     kin_pose, lean = kin_raw, None
     for _ in range(max(1, int(cfg.depth.passes)) if cfg.depth.reconstruct else 1):
         contact = detect_contacts(judged.contact_points, fps, cfg.contact, unit=k,
-                                  speeds=detection_speeds(judged, axis, fps, k, cfg.depth))
+                                  speeds=detection_speeds(judged, axis, fps, k, cfg.depth),
+                                  valid=valid)
         if lean is None:
-            lean = estimate_lean(judged, contact, axis, rest, fps, k, cfg.lean, ground.flight)
+            lean = estimate_lean(judged, contact, axis, rest, fps, k, cfg.lean, ground.flight, valid)
             kin, kin_pose = lean.apply(kin), lean.apply(kin_raw)
-        depth = reconstruct_depth(kin, kin_pose, contact, axis, fps, k, cfg.depth)
+        depth = reconstruct_depth(kin, kin_pose, contact, axis, fps, k, cfg.depth, valid)
         moved = depth.apply(kin)
-        ground = ground_offset(moved, fps, k, cfg.ground)
+        ground = ground_offset(moved, fps, k, cfg.ground, valid)
         judged = ground.apply(moved)
     kin = judged
     if ground.enabled:
@@ -294,6 +379,12 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         f'重なり {n_before} → {n_after} フレーム'
         + (f' / 補正 最大 {arms.correction_deg.max(initial=0.0):.1f} 度' if arms.side >= 0 else ''))
 
+    # ---- 9b. 腕・手のひら・指先と、体・相手の腕の接触 ----
+    local_before_contacts = local
+    local, contacts = resolve_contacts(skel, rt, kin.glob_rot, local, cfg.contacts, cfg.arm_collision,
+                                       cfg.hands.bones, cfg.arm_collision.mode, k, fps, rest.joints)
+    log_contacts(contacts, k, log)
+
     # ---- 10. VMD 書き出しと診断出力 ----
     tracks = build_tracks(skel, center.delta, ik, local, contact, cfg.vmd, k)
     model_name = cfg.vmd.model_name or skel.model_name or 'nlf2vmd'
@@ -308,12 +399,17 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         str(out_path or ''), n_keys, cfg, fps, k, motion, quats, kin, kin_raw, floor, contact,
         ik, center, ankle_rest, geom, rt.global_matrix('下半身', kin_raw.glob_rot), local, tracks,
         warnings=warns, depth=depth, ground=ground, lean=lean, arm_collision=arms, skeleton=skel,
-        retargeter=rt)
+        retargeter=rt, wrist=wrist, contacts=contacts, local_before_contacts=local_before_contacts,
+        smpl_rest=rest.joints)
     result.info = dict(
         frames=motion.num_frames, fps=fps, source_fps=motion.source_fps, scale=k,
         smpl_leg_length_m=smpl_leg, mmd_leg_length=skel.mean_leg_length(),
         skeleton=skel.source, model_name=model_name, bones=[t.name for t in tracks],
         fk_check_mm=motion.fk_check_mm, jitter=jitter_info,
+        wrist=None if wrist is None else wrist.info,
+        contacts=contacts.info,
+        interpolated=dict(frames=int((~valid).sum()), segments=len(gaps),
+                          longest_sec=round(float(longest_gap), 3)),
         floor=dict(tilt_deg=floor.tilt_deg, tilt_applied=floor.tilt_applied,
                    tilt_mode=floor.tilt_mode,
                    normal=floor.normal.tolist(), points=floor.num_points,

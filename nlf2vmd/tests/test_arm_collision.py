@@ -18,7 +18,9 @@ ARM_BONES = [s + b for s in '左右' for b in ('肩', '腕', 'ひじ', '手首')
 
 
 def _convert(body_model, motion, mode, pmx=None, extra=()):
-    cfg = load_config(overrides=['diagnostics.enabled=false', f'arm_collision.mode={mode}', *extra])
+    # ステージ9a だけを確かめる（9b の体との接触は test_contacts.py で確かめる）
+    cfg = load_config(overrides=['diagnostics.enabled=false', f'arm_collision.mode={mode}',
+                                 'contacts.enabled=false', *extra])
     return convert(motion, None, pmx=pmx, body_model=body_model, config=cfg, log=None)
 
 

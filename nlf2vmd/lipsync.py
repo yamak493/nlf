@@ -1,6 +1,6 @@
 """口パク（リップシンク）: 音素認識の結果から、MMD の口のモーフ（あ・い・う・え・お・ん）のキーを作る。
 
-ノートブック（mp4_to_mannequin_ja.ipynb のセル 15）では、Demucs で動画の音声からボーカルだけを取り出し、
+ノートブック（mp4_to_mannequin_ja.ipynb のセル 12）では、Demucs で動画の音声からボーカルだけを取り出し、
 Allosaurus でボーカルの音素（IPA）とその時刻を認識して、このモジュールでモーフのキーにする。
 Allosaurus の時刻は音素が鳴り始めるあたりの 1 点（CTC のスパイク。30ms 刻み）で、音素の長さは分からない。
 長さ（声が続いている間）と口の開き具合は、ボーカルの音量から決める。
@@ -461,7 +461,7 @@ def main(argv=None):
 
     ap = argparse.ArgumentParser(
         prog='python -m nlf2vmd.lipsync',
-        description='ノートブックのセル 15 が保存した音素認識の結果（lipsync_analysis.npz）から、'
+        description='ノートブックのセル 12 が保存した音素認識の結果（lipsync_analysis.npz）から、'
                     '口のモーフ（あ・い・う・え・お・ん）のキーを VMD に書き出します。')
     ap.add_argument('analysis', help='lipsync_analysis.npz')
     ap.add_argument('-o', '--output', help='口パクだけの VMD（既定: 入力と同じフォルダの lipsync.vmd）')

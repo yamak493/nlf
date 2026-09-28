@@ -11,6 +11,8 @@ input:
   coords: auto              # auto | camera（Y下向き・Z奥向き）| yup（Y上向き・右手系）。auto は入力の coord_system、無ければ camera
   person_index: 0           # 複数人物が含まれる場合に扱う人物の番号
   target_fps: 30.0          # リサンプル先の fps（MMD は 30fps）
+  max_gap_warn_sec: 0.5     # 人物を検出できなかった（valid=False の）区間がこれより長いと警告する。
+                            # そのフレームは前後から補間しただけなので、床・接地・奥行き・前後の傾きの推定には使わない
 
 # ---- 2. 姿勢のジッター制御 ----
 jitter:
@@ -25,6 +27,22 @@ jitter:
       wrist: {min_cutoff: 2.0, beta: 0.5}   # 手首・手
       leg:   {min_cutoff: 2.5, beta: 1.0}   # 股関節・膝・足首・足先
   root_median_window: 5     # ルート移動量のスパイク除去（メディアンの窓幅、フレーム）
+
+# ---- 2b. 手首の向きの補正（MediaPipe Hands。convert に hands_analysis を渡したときだけ） ----
+# 手のランドマーク（ノートブックのセル 10 / hands_analysis.npz）の 3D の点を、切り出しの ROI の回転と位置を戻して
+# カメラ座標に直し、手のひらの向きから手首の向きを求めて、NLF の手首の回転へ寄せる。
+wrist:
+  enabled: true
+  min_presence: 0.5         # 手の存在スコアがこれ以上のフレームだけ使う
+  full_presence: 0.7        # 存在スコアがこれ以上なら MediaPipe の向きをそのまま使う（min_presence との間は割合で混ぜる）
+  check_2d_deg: 45.0        # 3D の点の「手首 → 中指の付け根」の画面内の向きが、画像上の点とこれ以上違えば使わない
+  max_swing_deg: 100.0      # 前腕に対する手首の曲げがこれより大きい（関節として無理な）向きは使わない
+  max_twist_deg: 160.0      # 前腕に対する手首のひねりがこれより大きい向きは使わない
+  max_disagree_deg: 180.0   # NLF の手首の向きとの差がこれより大きい向きは使わない（180 で確認しない）
+  blend_sec: 0.1            # 重みをならすガウシアンの σ [秒]（見える・見えないの境目で向きが跳ねない）
+  strength: 1.0             # MediaPipe の向きに寄せる割合（0〜1）
+  fov_deg: 55.0             # カメラの長辺の画角（NLF と同じ）
+  smooth: {min_cutoff: 1.5, beta: 0.5, d_cutoff: 1.0}   # 補正した手首の回転に掛ける One Euro フィルタ
 
 # ---- 3. FK と接地点 ----
 body:
@@ -159,6 +177,28 @@ arm_collision:
   return_deg_per_s: 120.0   # 相手の腕が離れたあと、推定の姿勢へ戻す速さの上限（はね戻らないように）
   smooth_sec: 0.1           # 補正の回転をならすガウシアンの σ [秒]
 
+# ---- 9b. 腕・手のひら・指先と、体・相手の腕の接触（指先までの当たり判定） ----
+# 腕を 上腕・前腕・手のひら（3 本）・指の各節（指先まで）のカプセルで、体を PMX の剛体（無ければメッシュ・標準の形）の
+# カプセルで表し、重なったフレームで 手首 → ひじ → 肩 の順に動かしやすくして離す。腕どうしの組は arm_collision.mode の
+# 自重する腕の肩だけで離す（ステージ9a と同じ）。指の形は、手の形のキー（hands）を足した後にもう一度解き直す
+contacts:
+  enabled: true
+  body_source: auto         # auto（剛体 → 無ければメッシュ → 標準の形）| rigid | mesh | config | none（体とは判定しない）
+  cloth_margin_m: 0.01      # 剛体・標準の形に足す服の厚み（剛体は体より小さめに置かれることが多い）
+  margin_m: 0.002           # 表面どうしをこれだけ離す（触れるのは許す。それ以上は離さない）
+  skirt: soft               # スカートの物理の剛体: none（使わない）| soft（重なりの soft_ratio だけ離す）| hard
+  soft_ratio: 0.5           # 物理の剛体（スカート・胸）で離す割合（残りは MMD の物理演算に任せる）
+  fingers: true             # 手のひらと指の各節まで当たり判定に入れる（false なら手は 1 本の棒）
+  radius_percentile: 50.0   # 指・手のひらの太さ: その部位の頂点の、骨からの距離のこのパーセンタイル
+  radius_scale: 1.0         # 指・手のひらの太さに掛ける倍率
+  finger_radius_m: [0.009, 0.008, 0.008, 0.008, 0.007]   # メッシュが無いときの指の太さ（親指〜小指）
+  palm_radius_m: 0.012      # メッシュが無いときの手のひらの厚みの半分
+  upper_arm_skip: 0.35      # 上腕の肩側のこの割合は、体との判定から外す（脇は普段から胴に触れているため）
+  joint_weights: {shoulder: 4.0, elbow: 2.0, wrist: 1.0}   # 関節の動かしにくさ（大きいほど動かさない）
+  max_deg: {shoulder: 45.0, elbow: 30.0, wrist: 40.0}      # 補正の回転角の上限
+  return_deg_per_s: 120.0   # 触れていた物から離れたあと、推定の姿勢へ戻す速さの上限
+  smooth_sec: 0.1           # 補正をならすガウシアンの σ [秒]
+
 # ---- 10. VMD 書き出し ----
 vmd:
   model_name: ''            # 空なら PMX のモデル名（PMX が無ければ nlf2vmd）
@@ -171,7 +211,7 @@ diagnostics:
   enabled: true
   plots: true
 
-# ---- 口パク（リップシンク）: ノートブックのセル 15a / python -m nlf2vmd.lipsync ----
+# ---- 口パク（リップシンク）: ノートブックのセル 12a / python -m nlf2vmd.lipsync ----
 # Allosaurus で認識した音素を口の形（あ・い・う・え・お・ん）に分け、声が出ている間だけ口を動かす。
 # 音量は Demucs で取り出したボーカルのもの。dB のしきい値は「大きな声の音量（基準）」からの差で書く。
 lipsync:
@@ -207,7 +247,7 @@ lipsync:
   smooth_sec: 0.03          # 形の切り替え・開き具合の変化をならすガウシアンの σ [秒]
   thin_tolerance: 0.01      # キーの間引き: 線形補間との差がこれ以内なら省く（0 で全フレームにキー）
 
-# ---- 手の形（指）: ノートブックのセル 16a / python -m nlf2vmd.hands ----
+# ---- 手の形（指）: ノートブックのセル 13 / python -m nlf2vmd.hands ----
 # MediaPipe Hands の手のランドマーク（21 点）から指ごとの曲げを測り、手の形（下の presets の 9 種）に分けて、
 # 形ごとに決めた指の角度を指ボーンのキーにする。キーは形が変わる所だけに打つ。
 hands:

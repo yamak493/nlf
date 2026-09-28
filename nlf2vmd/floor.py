@@ -179,16 +179,20 @@ def _cosine_blend_curve(values, bounds, T, blend):
     return curve
 
 
-def estimate_floor(kin, fps, cfg, rest_points=None):
+def estimate_floor(kin, fps, cfg, rest_points=None, valid=None):
     """かかと・つま先の低速点から床を推定し、床が y=0・法線が +Y になる変換を返す。
 
     rest_points: (2 足, 2 [かかと, つま先], 3) 初期姿勢での接地点（tilt_method=vectors で、足裏が平らなときの
     かかと→つま先の上下成分に使う）。None なら同じ高さとみなす。
+    valid: (T,) bool 人物を検出できたフレーム。False のフレーム（前後から補間しただけ）は床の候補にしない。
     """
     T = len(kin.contact_points)
     pts = kin.contact_points.reshape(T, -1, 3)   # (T, 4, 3)
+    observed = np.ones(T, bool) if valid is None else np.asarray(valid, bool)
+    if not observed.any():
+        observed = np.ones(T, bool)
     speed = horizontal_speed(pts, fps)
-    low = speed < float(cfg.low_speed_m_per_s)
+    low = (speed < float(cfg.low_speed_m_per_s)) & observed[:, None]
     cand = pts[low]
     frame_of = np.nonzero(low)[0]
     rng = np.random.default_rng(int(cfg.seed))
@@ -229,7 +233,7 @@ def estimate_floor(kin, fps, cfg, rest_points=None):
 
     if fallback:
         # 低速点が足りない: 全フレームの接地点の低いほう 10% を床とみなす
-        heights = (pts.reshape(-1, 3) @ R.T)[:, 1]
+        heights = (pts[observed].reshape(-1, 3) @ R.T)[:, 1]
         heights = heights[heights <= np.percentile(heights, 10)]
     else:
         heights = (cand[inliers] @ R.T)[:, 1]

@@ -62,6 +62,55 @@ def read_interpolation(interp):
     return tuple(out)
 
 
+def bezier_weight(t, curve):
+    """MMD の補間曲線 ((x1, y1), (x2, y2))（0〜127）で、時刻の割合 t（0〜1）での値の割合（0〜1）。
+
+    曲線は (0, 0)・(x1, y1)・(x2, y2)・(127, 127) の 3 次ベジェ。x(s) = t となる s を二分法で求めて y(s) を返す。
+    """
+    (x1, y1), (x2, y2) = curve
+    x1, y1, x2, y2 = (v / 127.0 for v in (x1, y1, x2, y2))
+    t = np.clip(np.asarray(t, np.float64), 0.0, 1.0)
+
+    def bez(s, p1, p2):
+        u = 1.0 - s
+        return 3.0 * u * u * s * p1 + 3.0 * u * s * s * p2 + s ** 3
+
+    lo, hi = np.zeros_like(t), np.ones_like(t)
+    for _ in range(40):                   # x(s) は単調増加（制御点が 0〜1 の範囲なので）
+        mid = 0.5 * (lo + hi)
+        low = bez(mid, x1, x2) < t
+        lo, hi = np.where(low, mid, lo), np.where(low, hi, mid)
+    return bez(0.5 * (lo + hi), y1, y2)
+
+
+def sample_rotations(track, num_frames):
+    """BoneTrack の回転を 0〜num_frames-1 の毎フレームに展開する (T, 4)（MMD 座標のまま）。
+
+    キーの間は、後ろのキーの回転の補間曲線（MMD と同じ）で球面線形補間する。最初のキーより前は最初のキー、
+    最後のキーより後は最後のキーの回転。
+    """
+    from . import quat
+    frames = np.asarray(track.frames, np.int64)
+    order = np.argsort(frames, kind='stable')
+    frames = frames[order]
+    rots = quat.make_continuous(np.asarray(track.rotations, np.float64)[order])
+    out = np.empty((num_frames, 4))
+    t = np.arange(num_frames)
+    k = np.clip(np.searchsorted(frames, t, side='right') - 1, 0, len(frames) - 1)
+    out[:] = rots[k]
+    for i in range(len(frames) - 1):
+        f0, f1 = frames[i], frames[i + 1]
+        m = (t > f0) & (t < f1)
+        if not m.any():
+            continue
+        frac = (t[m] - f0) / float(f1 - f0)
+        if track.interp is not None:
+            frac = bezier_weight(frac, read_interpolation(np.asarray(track.interp)[order][i + 1])[3])
+        out[m] = quat.slerp(np.broadcast_to(rots[i], (m.sum(), 4)),
+                            np.broadcast_to(rots[i + 1], (m.sum(), 4)), frac)
+    return out
+
+
 def encode_name(name, nbytes, what='ボーン名'):
     raw = name.encode('cp932')
     if len(raw) > nbytes:

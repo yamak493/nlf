@@ -168,6 +168,27 @@ def intrinsics(image_size, fov_deg=55.0):
     return np.array([[f, 0.0, w / 2.0], [0.0, f, h / 2.0], [0.0, 0.0, 1.0]])
 
 
+def stabilized_joints(source, body_model, config=None, overrides=None):
+    """VMD の変換（ステージ 2）と同じジッター制御を掛けた関節の位置（カメラ座標 [mm]、(T, 24, 3)）。
+
+    手を切り出す位置に使う。NLF のフレームごとの推定のままでは手首が細かく震え、切り出しが揺れる。
+    source: convert に渡すのと同じ npz（カメラ座標）/ body_model: BodyModel か、その npz のパス。
+    fps は変えない（input.target_fps を 0 にする）ので、フレームは動画のフレームとそろう。
+    """
+    from .body_model import BodyModel, forward_kinematics
+    from .config import load_config
+    from .jitter import stabilize_pose, stabilize_root
+    from .motion_io import CAMERA_TO_YUP, load_motion
+
+    cfg = load_config(config, [*(overrides or []), 'input.target_fps=0', 'input.coords=camera'])
+    bm = body_model if isinstance(body_model, BodyModel) else BodyModel.from_npz(body_model)
+    motion = load_motion(source, cfg.input, bm)
+    quats, _ = stabilize_pose(motion.quats, motion.fps, cfg.jitter)
+    root = stabilize_root(motion.root_pos, cfg.jitter.root_median_window)
+    _, joints = forward_kinematics(quats, root, bm.rest_joints(motion.betas), bm.parents)
+    return joints @ CAMERA_TO_YUP.T * 1000.0   # Y 上向き → カメラ座標（X 軸まわりの 180 度は自分自身の逆）
+
+
 def joint_rois(joints3d, image_size, roi_m=0.25, fov_deg=55.0):
     """NLF の関節（カメラ座標 [mm]、(T, 24, 3)）から、左右の手の最初の ROI (T, 2, 4)。
 

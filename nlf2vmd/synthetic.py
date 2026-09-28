@@ -251,3 +251,28 @@ def add_arm_cross(motion, left_depth=0.0, right_depth=0.0):
             q[t, elbow] = quat.mul(quat.conj(g_upper), g_fore)
         q[:, wrist] = quat.IDENTITY
     return dict(motion, pose=quat.to_rotvec(q))
+
+
+def add_arm_reach(motion, side, elbow_dir, hand_target, twist_deg=0.0):
+    """片腕（side: 0 = 左、1 = 右）の上腕を elbow_dir の向きへ、前腕を hand_target（体の座標 [m]。スカラーか (T, 3)）の
+    位置へ向ける。twist_deg は手首の、前腕の軸まわりのひねり [度]（0 で手のひらは初期姿勢（T ポーズ）と同じ向き）。
+    add_arm_cross と同じく、背骨と鎖骨の回転が 0 のモーションに使う。"""
+    J = SMPL_REST_JOINTS
+    q = quat.from_rotvec(np.asarray(motion['pose'], float))
+    T = len(q)
+    shoulder, elbow, wrist = 16 + side, 18 + side, 20 + side
+    upper = np.linalg.norm(J[elbow] - J[shoulder])
+    hand = np.broadcast_to(np.asarray(hand_target, float), (T, 3))
+    d = np.asarray(elbow_dir, float) / np.linalg.norm(elbow_dir)
+    elbow_target = J[shoulder] + upper * d
+    g_upper = quat.from_two_vectors(J[elbow] - J[shoulder], elbow_target - J[shoulder])
+    elbow_pos = J[shoulder] + quat.rotate(g_upper, J[elbow] - J[shoulder])
+    fore = J[wrist] - J[elbow]
+    for t in range(T):
+        g_fore = quat.from_two_vectors(fore, hand[t] - elbow_pos)
+        q[t, shoulder] = g_upper
+        q[t, elbow] = quat.mul(quat.conj(g_upper), g_fore)
+    axis = (J[22 + side] - J[wrist]) / np.linalg.norm(J[22 + side] - J[wrist])
+    q[:, wrist] = quat.from_rotvec(np.deg2rad(twist_deg) * axis)
+    return dict(motion, pose=quat.to_rotvec(q))
+

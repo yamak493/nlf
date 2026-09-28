@@ -470,3 +470,32 @@ def test_joint_rois_projection():
     K = hd.intrinsics((640, 480))
     np.testing.assert_allclose(wrists[0, 0], [320 + K[0, 0] * 200 / 3000, 240], atol=1e-6)
     np.testing.assert_allclose(rois[0, 0, 2], K[0, 0] * 250 / 3000)
+
+
+def test_stabilized_joints_camera_coords(body_model):
+    """手を切り出す位置: カメラ座標のまま・動画の fps のまま、ジッター制御だけを掛けた関節の位置。"""
+    from nlf2vmd.body_model import forward_kinematics
+    from nlf2vmd.synthetic import add_joint_noise, synthetic_walk, to_camera_coords
+    fps = 25.0   # MMD の 30fps にリサンプルしないこと
+    motion = to_camera_coords(synthetic_walk(num_frames=100, fps=fps), height=1.2, pitch_deg=10.0)
+    T = len(motion['pose'])
+
+    # ジッター制御を無効にすると、入力をそのまま FK した位置（カメラ座標 [mm]）と一致する
+    off = ['jitter.outlier_deg_per_s=1e9', 'jitter.root_median_window=1',
+           *[f'jitter.one_euro.groups.{g}.min_cutoff=0'
+             for g in ('torso', 'head', 'arm', 'wrist', 'leg')]]
+    joints = hd.stabilized_joints(motion, body_model, overrides=off)
+    rest = body_model.rest_joints(motion['betas'])
+    _, ref = forward_kinematics(quat.from_rotvec(motion['pose']), motion['trans'] + rest[0], rest,
+                                body_model.parents)
+    assert joints.shape == (T, 24, 3)
+    np.testing.assert_allclose(joints, ref * 1000.0, atol=1e-6)
+
+    # 既定のジッター制御では、関節の回転の震えによる手首の細かい揺れが小さくなる
+    noisy = dict(motion, pose=add_joint_noise(
+        motion, {j: 3.0 for j in (13, 14, 16, 17, 18, 19, 20, 21)}, smooth_frames=0.5)['pose'])
+    raw = hd.stabilized_joints(noisy, body_model, overrides=off)
+    smooth = hd.stabilized_joints(noisy, body_model)
+    wrist = list(hd.WRIST_JOINTS)
+    shake = lambda j: np.linalg.norm(np.diff(j[:, wrist], 2, axis=0), axis=-1).mean()  # noqa: E731
+    assert shake(smooth) < 0.5 * shake(raw)

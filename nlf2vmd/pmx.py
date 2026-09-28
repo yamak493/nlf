@@ -1,8 +1,9 @@
-"""PMX（2.0 / 2.1）の読み込み。変換に必要なボーン情報と、モーフの名前だけを取り出す。
+"""PMX（2.0 / 2.1）の読み込み。変換に必要なボーン情報と、モーフの名前・剛体だけを取り出す。
 
-頂点は位置と、ウェイトが最も大きいボーンだけを読む（腕の太さを測るのに使う）。
+頂点は位置と、ウェイトが最も大きいボーンだけを読む（腕・指の太さや体の当たり判定を測るのに使う）。
 面・テクスチャ・材質は読み飛ばす（ボーンはそれらの後ろに並んでいるため）。
-モーフ（口パクのキーを打つ先があるかの確認に使う）はボーンの後ろにある。
+モーフ（口パクのキーを打つ先があるかの確認に使う）はボーンの後ろ、剛体（体の当たり判定に使う）は
+モーフ・表示枠の後ろにある。
 """
 import struct
 from dataclasses import dataclass, field
@@ -30,6 +31,19 @@ class PmxMorph:
 
 
 @dataclass
+class PmxRigid:
+    name: str
+    bone: int                 # 関連ボーンの番号（-1 = なし）
+    group: int                # 衝突グループ（0〜15）
+    mask: int                 # 非衝突グループのビット
+    shape: int                # 0 = 球 / 1 = 箱 / 2 = カプセル
+    size: np.ndarray          # 球: (半径, -, -) / 箱: (x, y, z の半分の長さ) / カプセル: (半径, 高さ, -)
+    position: np.ndarray      # (3,) MMD 座標（初期姿勢での位置）
+    rotation: np.ndarray      # (3,) ラジアン（x, y, z。回転の順は Z → X → Y）
+    mode: int                 # 0 = ボーン追従 / 1 = 物理演算 / 2 = 物理演算（ボーン位置合わせ）
+
+
+@dataclass
 class PmxModel:
     name: str
     name_en: str
@@ -37,6 +51,7 @@ class PmxModel:
     morphs: list = field(default_factory=list)   # 読めなかったときは None
     vertices: np.ndarray = None       # (N, 3) 頂点の位置（MMD 座標）
     vertex_bones: np.ndarray = None   # (N,) 頂点のウェイトが最も大きいボーンの番号
+    rigid_bodies: list = None         # PmxRigid のリスト（読めなかったときは None）
 
     def bone_index(self, name):
         for i, b in enumerate(self.bones):
@@ -183,4 +198,26 @@ def read_pmx(path):
                 morphs.append(PmxMorph(mname, mname_en, panel, kind))
         except (ValueError, struct.error):
             morphs = None
-    return PmxModel(name, name_en, bones, morphs, vertices, vertex_bones)
+
+    # ---- 表示枠（読み飛ばす）・剛体 ----
+    rigids = [] if morphs is not None else None
+    if morphs is not None and r.pos < len(r.data):
+        try:
+            for _ in range(r.i32()):
+                text(), text()
+                r.u8()                            # 特殊枠
+                for _ in range(r.i32()):
+                    r.index(bsize if r.u8() == 0 else morph_size)
+            for _ in range(r.i32()):
+                rname = text()
+                text()
+                bone = r.index(bsize)
+                group, mask = r.u8(), r.unpack('H')[0]
+                shape = r.u8()
+                size, pos, rot = r.vec(3), r.vec(3), r.vec(3)
+                r.skip(20)                        # 質量・移動減衰・回転減衰・反発力・摩擦力
+                mode = r.u8()
+                rigids.append(PmxRigid(rname, bone, group, mask, shape, size, pos, rot, mode))
+        except (ValueError, struct.error):
+            rigids = None
+    return PmxModel(name, name_en, bones, morphs, vertices, vertex_bones, rigids)

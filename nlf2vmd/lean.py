@@ -195,11 +195,12 @@ def _refine(cost, grid):
     return theta, ~inner & (len(grid) > 1)
 
 
-def estimate_lean(kin, contact, depth_axis, rest, fps, unit, cfg, flight=None):
+def estimate_lean(kin, contact, depth_axis, rest, fps, unit, cfg, flight=None, valid=None):
     """ステージ6c。kin: 床 y=0 の座標（ステージ6a の接地の拘束の後、MMD 単位）/ contact: ステージ6 の接地判定。
 
     rest: 体型の初期姿勢の情報（重心と支持点の基準のずれに使う）/ unit: スケール係数。
     flight: (T,) bool ジャンプとして残した滞空のフレーム（ステージ6a）。支持が無いので使わない。
+    valid: (T,) bool 人物を検出できたフレーム。False のフレーム（前後から補間しただけ）は補正角を求めるのに使わない。
     接地判定から漏れた短い区間（歩行の踏み替え・接地の始まりと終わり）は、前後の支持点の中心を直線でつないだ
     点を支持点とする（足圧中心は後ろの足から前の足へ移る）。漏れたフレームを除くと、重心が足から最も離れる
     接地の端が抜けて平均が偏る（合成の歩行で 3 度前後）。
@@ -213,7 +214,8 @@ def estimate_lean(kin, contact, depth_axis, rest, fps, unit, cfg, flight=None):
 
     flags = np.asarray(contact.flags, bool)
     n_feet = flags.sum(1)
-    supported = n_feet > 0
+    observed = np.ones(T, bool) if valid is None else np.asarray(valid, bool)
+    supported = (n_feet > 0) & observed
     if not cfg.enabled or supported.sum() < max(3, int(round(fps))):
         return LeanResult(zeros, np.zeros((T, 3)), d, axis, nan, nan, supported, False)
 
@@ -233,7 +235,7 @@ def estimate_lean(kin, contact, depth_axis, rest, fps, unit, cfg, flight=None):
             filled[s:e + 1] = True
     if flight is not None:
         filled &= ~np.asarray(flight, bool)
-    used = supported | filled
+    used = (supported | filled) & observed
     # 基準のずれ: 初期姿勢での「支持点の中心 → 重心」を骨盤の左右の向きに合わせて回したもの
     fwd = kin.glob_rot[:, 0, :, 2] * [1.0, 0.0, 1.0]
     fwd /= np.maximum(np.linalg.norm(fwd, axis=1, keepdims=True), 1e-9)

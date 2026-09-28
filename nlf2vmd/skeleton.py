@@ -42,7 +42,7 @@ SIDES = ('左', '右')
 
 class Skeleton:
     def __init__(self, positions, parents, tails, model_name='', source='standard',
-                 mesh_points=None, mesh_bones=None):
+                 mesh_points=None, mesh_bones=None, rigid_bodies=None):
         self.positions = {k: np.asarray(v, np.float64) for k, v in positions.items()}
         self.parents = dict(parents)
         self.tails = {k: np.asarray(v, np.float64) for k, v in tails.items() if v is not None}
@@ -51,6 +51,8 @@ class Skeleton:
         # PMX の頂点（MMD 座標）と、そのウェイトが最も大きいボーンの名前。標準ボーンでは None
         self.mesh_points = mesh_points
         self.mesh_bones = mesh_bones
+        # PMX の剛体: [dict(name, bone（ボーン名）, shape, size, position（MMD 座標）, rotation, mode)]。無ければ None
+        self.rigid_bodies = rigid_bodies
 
     @classmethod
     def standard(cls):
@@ -78,7 +80,14 @@ class Skeleton:
             idx = np.asarray(model.vertex_bones)
             bones = names[np.where((idx >= 0) & (idx < len(model.bones)), idx, len(model.bones))]
             points = np.asarray(model.vertices, np.float64)
-        return cls(pos, par, tails, model.name, 'pmx', points, bones)
+        rigids = None
+        if model.rigid_bodies is not None:
+            rigids = [dict(name=rb.name, shape=int(rb.shape), size=np.asarray(rb.size, np.float64),
+                           position=np.asarray(rb.position, np.float64),
+                           rotation=np.asarray(rb.rotation, np.float64), mode=int(rb.mode),
+                           bone=model.bones[rb.bone].name if 0 <= rb.bone < len(model.bones) else None)
+                      for rb in model.rigid_bodies]
+        return cls(pos, par, tails, model.name, 'pmx', points, bones, rigids)
 
     def has(self, name):
         return name in self.positions
@@ -101,6 +110,16 @@ class Skeleton:
 
     def mean_leg_length(self):
         return 0.5 * (self.leg_length(0) + self.leg_length(1))
+
+    def is_descendant(self, name, ancestor):
+        """name が ancestor そのもの、またはその子孫か。"""
+        seen = set()
+        while name is not None and name not in seen:
+            if name == ancestor:
+                return True
+            seen.add(name)
+            name = self.parents.get(name)
+        return False
 
     def nearest_ancestor(self, name, candidates):
         """name の祖先のうち、candidates に含まれる最も近いボーン（無ければ None）。"""
