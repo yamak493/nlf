@@ -116,16 +116,26 @@ class WristResult:
     info: dict = field(default_factory=dict)
 
 
-def _nearest_fill(values, mask):
-    """mask が False のフレームの値を、最も近い True のフレームの値で埋める（mask が全部 False なら元のまま）。"""
+def _gap_fill(q, mask):
+    """mask が False のフレームの回転 (T, 4) を、前後の True のフレームの回転の球面線形補間で埋める（片側にしか
+    無ければその値を続ける。mask が全部 False なら元のまま）。
+
+    最も近いフレームの値で埋めると、見えない区間の真ん中で前の値から後の値へ 1 フレームで切り替わり、
+    重みが 0 でない所では手首が跳ねる。
+    """
     if not mask.any():
-        return values
+        return q
     idx = np.flatnonzero(mask)
     t = np.arange(len(mask))
-    near = idx[np.clip(np.searchsorted(idx, t), 0, len(idx) - 1)]
-    prev = idx[np.clip(np.searchsorted(idx, t) - 1, 0, len(idx) - 1)]
-    near = np.where(np.abs(prev - t) <= np.abs(near - t), prev, near)
-    return values[near]
+    k = np.searchsorted(idx, t)
+    prev = idx[np.clip(k - 1, 0, len(idx) - 1)]
+    nxt = idx[np.clip(k, 0, len(idx) - 1)]
+    prev = np.where(mask, t, prev)
+    nxt = np.where(mask, t, nxt)
+    prev = np.where(t < idx[0], nxt, prev)      # 最初の観測より前は、その値を続ける
+    nxt = np.where(t > idx[-1], prev, nxt)      # 最後の観測より後も同じ
+    span = np.maximum(nxt - prev, 1)
+    return quat.slerp(q[prev], q[nxt], (t - prev) / span)
 
 
 def observed_targets(analysis, rest_joints, cfg):
@@ -207,11 +217,14 @@ def correct_wrists(quats, fk, rest_joints, analysis, fps, cfg):
         sigma = float(cfg.blend_sec) * fps
         w = np.clip(filters.gaussian_time(w, sigma, radius=2.0 * sigma), 0.0, 1.0) \
             * float(cfg.strength)
-        local_t = _nearest_fill(local_t, use)
-        q = quat.make_continuous(quat.slerp(cur, local_t, w))
+        local_t = _gap_fill(local_t, use)
+        # ならすのは NLF の回転に掛ける補正（手首の座標系）のほう。回転そのものをならすと、重みが 0 になる境目で
+        # 「ならした NLF の回転」から「NLF の回転」へ 1 フレームで切り替わって跳ねる。補正なら境目では単位回転に近い
+        delta = quat.make_continuous(quat.mul(quat.conj(cur), quat.slerp(cur, local_t, w)))
         sm = cfg.smooth
-        q = quat.normalize(filters.one_euro(q, fps, float(sm.min_cutoff), float(sm.beta),
-                                            float(sm.d_cutoff), True, vector_axis=-1))
+        delta = quat.normalize(filters.one_euro(delta, fps, float(sm.min_cutoff), float(sm.beta),
+                                                float(sm.d_cutoff), True, vector_axis=-1))
+        q = quat.mul(cur, delta)
         # 補正の届かないフレーム（重みが 0 の所）は、NLF の回転をそのまま残す
         q = np.where((w > 1e-4)[:, None], q, cur)
         out[:, WRIST[s]] = quat.make_continuous(q)

@@ -353,7 +353,8 @@ def _resolve_sequential(Y, O, R, Gp, p):
     local = np.eye(3)                   # 前のフレームの補正（肩の座標系）
     skip = np.zeros(len(R), bool)       # 扱わない組
     for t in range(T):
-        carried = _angle(local) > 1e-9
+        # _angle は arccos なので 1e-8 rad 程度より小さい角を区別できない（丸め誤差で単位回転に戻りきらない）
+        carried = _angle(local) > 1e-6
         if not carried and (raw_pen[t] <= 0.0).all():
             skip[:] = False
             continue

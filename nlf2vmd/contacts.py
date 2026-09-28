@@ -50,6 +50,7 @@ DAMPING = 0.05
 MIN_VERTICES = 20
 NEAR_M = 0.1                  # 1 フレームを解くとき、表面どうしがこれより近い組だけを使う（遠い組は条件に効かない）
 NEAR_ROUNDS = 4               # 解いた姿勢で近くなった組を加えて解き直す回数の上限
+IDENTITY_RAD = 1e-6           # 補正がこれより小さければ単位回転（補正なし）とみなす
 _EPS = 1e-9
 # 剛体もメッシュも無いときの体の形。モデルの体格に合わせて、肩幅（左右の腕ボーンの間）と腰幅（左右の足ボーンの間）
 # に対する割合で決める（成人の体の寸法の比から）:
@@ -610,7 +611,9 @@ def _raw_penetration(arm_ends, body_ends, pairs):
 
 
 def _is_identity(states):
-    return all(_angle(st[0]) < 1e-9 and abs(st[1]) < 1e-9 and _angle(st[2]) < 1e-9 for st in states)
+    # _angle は arccos なので 1e-8 rad 程度より小さい角を区別できない（丸め誤差で単位回転に戻りきらない）
+    return all(_angle(st[0]) < IDENTITY_RAD and abs(st[1]) < IDENTITY_RAD
+               and _angle(st[2]) < IDENTITY_RAD for st in states)
 
 
 def resolve_contacts(skel, rt, glob_rot, local, cfg, arm_cfg, finger_bones, yield_mode, unit, fps,
@@ -721,6 +724,9 @@ def resolve_contacts(skel, rt, glob_rot, local, cfg, arm_cfg, finger_bones, yiel
         body = body_ends[t]
         goal = [_toward_identity(st, p.return_step) for st in prev]
         cur = _solve_near(arms, body, pairs, prev, p, goal, skip)
+        if _is_identity(cur):
+            # 推定の姿勢へ戻りきった。丸め誤差を残すと、次のフレームから重なりが無くても毎フレーム解くことになる
+            cur = identity
         over = _penetration(arms, cur, body, pairs) > p.tol
         for s in range(2):
             if _saturated(cur[s], p):
