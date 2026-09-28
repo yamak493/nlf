@@ -48,6 +48,8 @@ MIN_LEVER_M = 0.01
 TOLERANCE_M = 1e-4
 DAMPING = 0.05
 MIN_VERTICES = 20
+NEAR_M = 0.1                  # 1 フレームを解くとき、表面どうしがこれより近い組だけを使う（遠い組は条件に効かない）
+NEAR_ROUNDS = 4               # 解いた姿勢で近くなった組を加えて解き直す回数の上限
 _EPS = 1e-9
 # 剛体もメッシュも無いときの体の形。モデルの体格に合わせて、肩幅（左右の腕ボーンの間）と腰幅（左右の足ボーンの間）
 # に対する割合で決める（成人の体の寸法の比から）:
@@ -385,6 +387,7 @@ class _Params:
     min_lever: float
     tol: float
     return_step: float
+    near: float = np.inf     # _solve_near で使う組の距離 [MMD 単位]
 
 
 def _identity_state():
@@ -409,9 +412,34 @@ def _pair_geometry(arms, states, body, pairs):
     return cp, cq, applied, P0, Q0
 
 
-def _penetration(arms, states, body, pairs):
+def _gap(arms, states, body, pairs):
+    """組ごとの重なり（離す割合を掛ける前。負なら離れている距離）。"""
     cp, cq, _, _, _ = _pair_geometry(arms, states, body, pairs)
-    return (pairs.R - np.linalg.norm(cp - cq, axis=-1)) * pairs.w
+    return pairs.R - np.linalg.norm(cp - cq, axis=-1)
+
+
+def _penetration(arms, states, body, pairs):
+    return _gap(arms, states, body, pairs) * pairs.w
+
+
+def _subset(pairs, m):
+    return _Pairs(*(getattr(pairs, f)[m] for f in ('kind', 'side', 'i', 'j', 'R', 'w', 'level', 'trim')))
+
+
+def _solve_near(arms, body, pairs, states, p, goal=None, skip=None):
+    """_solve_frame を、表面どうしが p.near より近い組だけで解く（全部の組では 1 回ごとの計算が重い）。
+
+    解いた姿勢で近くなった組があれば、それも加えて初期値から解き直す（NEAR_ROUNDS 回まで）。
+    """
+    skip = np.zeros(len(pairs.i), bool) if skip is None else skip
+    near = _gap(arms, states, body, pairs) > -p.near
+    for _ in range(NEAR_ROUNDS):
+        out = _solve_frame(arms, body, _subset(pairs, near), states, p, goal, skip[near])
+        grown = near | (_gap(arms, out, body, pairs) > -p.near)
+        if (grown == near).all():
+            return out
+        near = grown
+    return _solve_frame(arms, body, _subset(pairs, near), states, p, goal, skip[near])
 
 
 def _solve_frame(arms, body, pairs, states, p, goal=None, skip=None):
@@ -553,10 +581,10 @@ class ContactResult:
                 int((self.depth_after > tol).any(axis=(1, 2)).sum()))
 
 
-def _part_depth(pen, pairs, parts):
-    """組ごとの重なり（離す割合を掛ける前）(..., npairs) → 腕ごと・部位ごとの最も深い重なり (..., 2, 8)。"""
+def _part_depth(pen, pairs, part):
+    """組ごとの重なり（離す割合を掛ける前）(..., npairs) → 腕ごと・部位ごとの最も深い重なり (..., 2, 8)。
+    part: (npairs,) 組の動かす腕のカプセルの部位（PARTS の番号）。"""
     out = np.full(pen.shape[:-1] + (2, len(PARTS)), -np.inf)
-    part = np.array([parts[s][i] for s, i in zip(pairs.side, pairs.i)], int)
     for s in range(2):
         for k in range(len(PARTS)):
             m = (pairs.side == s) & (part == k)
@@ -670,11 +698,13 @@ def resolve_contacts(skel, rt, glob_rot, local, cfg, arm_cfg, finger_bones, yiel
                    float(k.wrist) * hand ** 2]
     mx = cfg.max_deg
     p = _Params(np.deg2rad([float(mx.shoulder), float(mx.elbow), float(mx.wrist)]), cost,
-                MIN_LEVER_M * unit, TOLERANCE_M * unit, np.deg2rad(float(cfg.return_deg_per_s)) / fps)
+                MIN_LEVER_M * unit, TOLERANCE_M * unit, np.deg2rad(float(cfg.return_deg_per_s)) / fps,
+                NEAR_M * unit)
 
     # ---- 補正の無いときの重なり（全フレームをまとめて）----
+    pair_part = np.array([parts[s][i] for s, i in zip(pairs.side, pairs.i)], int)
     raw_all = _raw_penetration(arm_ends, body_ends, pairs)            # (T, npairs)
-    before = _part_depth(raw_all, pairs, parts)
+    before = _part_depth(raw_all, pairs, pair_part)
     raw_w = raw_all * pairs.w
 
     # ---- 1 回目: フレームの順に（前のフレームの補正を持ち越す） ----
@@ -690,7 +720,7 @@ def resolve_contacts(skel, rt, glob_rot, local, cfg, arm_cfg, finger_bones, yiel
         arms = [arm_at(0, t), arm_at(1, t)]
         body = body_ends[t]
         goal = [_toward_identity(st, p.return_step) for st in prev]
-        cur = _solve_frame(arms, body, pairs, prev, p, goal, skip)
+        cur = _solve_near(arms, body, pairs, prev, p, goal, skip)
         over = _penetration(arms, cur, body, pairs) > p.tol
         for s in range(2):
             if _saturated(cur[s], p):
@@ -706,7 +736,7 @@ def resolve_contacts(skel, rt, glob_rot, local, cfg, arm_cfg, finger_bones, yiel
     al = np.array([[st[s][1] for s in range(2)] for st in states])
     Aw = quat.to_rotvec(quat.from_matrix(np.array([[st[s][2] for s in range(2)] for st in states])))
     As, al, Aw = (filters.gaussian_time(x, sigma) for x in (As, al, Aw))
-    after = before.copy()
+    pen_after = raw_all.copy()
     final = []
     for t in range(T):
         st = [(_rotation(As[t, s]), float(al[t, s]), _rotation(Aw[t, s])) for s in range(2)]
@@ -717,10 +747,11 @@ def resolve_contacts(skel, rt, glob_rot, local, cfg, arm_cfg, finger_bones, yiel
         body = body_ends[t]
         pen = _penetration(arms, st, body, pairs)
         if ((pen > p.tol) & ~ignored[t]).any():
-            st = _solve_frame(arms, body, pairs, st, p, skip=ignored[t])
+            st = _solve_near(arms, body, pairs, st, p, skip=ignored[t])
             pen = _penetration(arms, st, body, pairs)
-        after[t] = _part_depth(pen / np.maximum(pairs.w, 1e-9), pairs, parts)
+        pen_after[t] = pen / np.maximum(pairs.w, 1e-9)
         final.append(st)
+    after = _part_depth(pen_after, pairs, pair_part)
 
     # ---- ローカル回転へ ----
     out = dict(local)

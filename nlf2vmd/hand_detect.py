@@ -116,9 +116,17 @@ def crop(image, roi, size=INPUT_SIZE):
     """ROI を size×size に切り出す（双線形補間。はみ出した所は端の色）。float32 0〜1。"""
     X, Y = _roi_grid(roi, size)
     img = np.asarray(image)
+    # ROI を囲む範囲（補間に使う隣の画素まで）だけを取り出す（画像全体を float にすると 1 回ごとに重い）
+    H, W = img.shape[:2]
+    rows, cols = Y - 0.5, X - 0.5
+    y0 = int(np.clip(np.floor(rows.min()) - 1, 0, H - 1))
+    y1 = int(np.clip(np.ceil(rows.max()) + 1, 0, H - 1))
+    x0 = int(np.clip(np.floor(cols.min()) - 1, 0, W - 1))
+    x1 = int(np.clip(np.ceil(cols.max()) + 1, 0, W - 1))
+    patch = img[y0:y1 + 1, x0:x1 + 1, :3].astype(np.float32)
     out = np.empty((size, size, 3), np.float32)
     for k in range(3):
-        out[..., k] = map_coordinates(img[..., k].astype(np.float32), [Y - 0.5, X - 0.5], order=1,
+        out[..., k] = map_coordinates(patch[..., k], [rows - y0, cols - x0], order=1,
                                       mode='nearest')
     return out / 255.0
 
