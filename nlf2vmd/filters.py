@@ -87,6 +87,25 @@ def gaussian_time(x, sigma, radius=None):
     return gaussian_filter1d(x, float(sigma), axis=0, mode='nearest', truncate=truncate)
 
 
+def rate_limit(x, step):
+    """(T, ...) の列の 1 フレームの変化の大きさ（最後の軸のノルム）を step 以下にする。前向きと後ろ向きに掛けた
+    結果の平均（どちらも変化が step 以下なので平均も step 以下。片向きだけだと遅れる）。
+
+    変化が step 以下のフレームはそのまま。各フレームの値は前後の値を結ぶ線分の上にとるので、凸な範囲に入っている
+    列は、掛けた後も同じ範囲に入っている。
+    """
+    def one_way(v):
+        y = np.array(v, np.float64, copy=True)
+        for t in range(1, len(y)):
+            d = y[t] - y[t - 1]
+            n = float(np.linalg.norm(d))
+            if n > step:
+                y[t] = y[t - 1] + d * (step / n)
+        return y
+    x = np.asarray(x, np.float64)
+    return 0.5 * (one_way(x) + one_way(x[::-1])[::-1])
+
+
 def smoothstep(t):
     t = np.clip(np.asarray(t, np.float64), 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)

@@ -29,6 +29,7 @@ from .skeleton import REQUIRED_BONES, SIDES, Skeleton
 from .twist import split_twist
 from .vmd import BoneTrack, sample_rotations, thin_track, to_mmd_position, to_mmd_quat, write_vmd
 from .wrist import correct_wrists
+from .wrist_limits import limit_wrists
 
 BODY_MODEL_FILENAME = 'smpl_body_model.npz'
 
@@ -66,6 +67,7 @@ class ConversionResult:
     contacts: object = None      # ステージ9b（腕・手のひら・指先と体・相手の腕の接触）の結果
     local_before_contacts: dict = None   # ステージ9b の前のローカル回転（指の形を入れて 9b をやり直すのに使う）
     twist: object = None         # 捩りボーンへのひねりの振り分け（twist.TwistResult）
+    wrist_limits: object = None  # ステージ9c（手首の可動域）の結果（9b の後に掛けたもの）
     smpl_rest: np.ndarray = None  # SMPL の初期姿勢の関節（体型を固定したもの）
     skeleton: object = None      # 対象モデルの骨格（variants.py で種類別のキーを作り直すのに使う）
     retargeter: object = None
@@ -182,6 +184,24 @@ def log_twist(twist, log):
         log(f'[10] {note}')
 
 
+def log_wrist_limits(before, after, log, label='[9c]'):
+    """before / after: 9b の前・後に掛けた limit_wrists の WristLimitResult（before は None でもよい）。"""
+    if log is None:
+        return
+    if not after.enabled:
+        log(f'{label} 手首の可動域: 扱いません')
+        return
+    lr = '左 {}・右 {}'.format
+    parts = []
+    if before is not None:
+        parts.append('範囲の外 ' + lr(*before.info['out_of_range_frames']) + ' フレーム（9b の前）')
+    parts.append(lr(*after.info['out_of_range_frames']) + ' フレーム（9b の後）')
+    corr = [max(a, b) for a, b in zip(after.info['max_correction_deg'],
+                                      before.info['max_correction_deg'] if before else (0.0, 0.0))]
+    log(f'{label} 手首の可動域: ' + ' / '.join(parts)
+        + f' / 補正 最大 左 {corr[0]:.1f}・右 {corr[1]:.1f} 度')
+
+
 def apply_hand_poses(result, hand_tracks, log=print):
     """指のキー（hands.make_hands の tracks）を入れた指の形で、ステージ9b（接触の解決）をやり直す。
 
@@ -197,7 +217,10 @@ def apply_hand_poses(result, hand_tracks, log=print):
         result.skeleton, result.retargeter, result.kin.glob_rot, result.local_before_contacts,
         cfg.contacts, cfg.arm_collision, cfg.hands.bones, cfg.arm_collision.mode, result.scale,
         result.fps, result.smpl_rest, finger_local=finger_local)
+    local, limits = limit_wrists(result.skeleton, local, cfg.wrist_limits, result.fps)
     result.local_quats = local
+    result.wrist_limits = limits
+    result.info['wrist_limits'] = limits.info
     result.contacts = contacts
     result.twist = split_twist(result.skeleton, local, cfg.twist)
     result.tracks = build_tracks(result.skeleton, result.center.delta, result.foot_ik, local,
@@ -205,6 +228,7 @@ def apply_hand_poses(result, hand_tracks, log=print):
     result.info['contacts'] = contacts.info
     result.info['twist'] = result.twist.info
     log_contacts(contacts, result.scale, log, label='[9b 指の形を入れて]')
+    log_wrist_limits(None, limits, log, label='[9c 指の形を入れて]')
     return contacts
 
 
@@ -286,7 +310,8 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
             def fk(q):
                 return forward_kinematics(q, root, rest_joints, bm.parents)[0]
 
-            quats, wrist = correct_wrists(quats, fk, rest_joints, analysis, fps, cfg.wrist)
+            quats, wrist = correct_wrists(quats, fk, rest_joints, analysis, fps, cfg.wrist,
+                                          cfg.wrist_limits)
             parts = []
             for s, name in zip(SIDES, ('left', 'right')):
                 d = wrist.info[name]
@@ -406,10 +431,16 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         + (f' / 補正 最大 {arms.correction_deg.max(initial=0.0):.1f} 度' if arms.side >= 0 else ''))
 
     # ---- 9b. 腕・手のひら・指先と、体・相手の腕の接触 ----
+    # 手首は先に可動域に収めてから解く（9c。人の関節では届かない向きの手で当たり判定をしない）
+    local, limits_pre = limit_wrists(skel, local, cfg.wrist_limits, fps)
     local_before_contacts = local
     local, contacts = resolve_contacts(skel, rt, kin.glob_rot, local, cfg.contacts, cfg.arm_collision,
                                        cfg.hands.bones, cfg.arm_collision.mode, k, fps, rest.joints)
     log_contacts(contacts, k, log)
+
+    # ---- 9c. 手首の可動域（9b で手首を回した分も含めて、人の関節の範囲に収める） ----
+    local, limits = limit_wrists(skel, local, cfg.wrist_limits, fps)
+    log_wrist_limits(limits_pre, limits, log)
 
     # ---- 10. 捩りボーンへのひねりの振り分け（キーは build_tracks が同じように分けて作る）・VMD 書き出しと診断出力 ----
     twist = split_twist(skel, local, cfg.twist)
@@ -428,7 +459,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         ik, center, ankle_rest, geom, rt.global_matrix('下半身', kin_raw.glob_rot), local, tracks,
         warnings=warns, depth=depth, ground=ground, lean=lean, arm_collision=arms, skeleton=skel,
         retargeter=rt, wrist=wrist, contacts=contacts, local_before_contacts=local_before_contacts,
-        twist=twist, smpl_rest=rest.joints)
+        twist=twist, smpl_rest=rest.joints, wrist_limits=limits)
     result.info = dict(
         frames=motion.num_frames, fps=fps, source_fps=motion.source_fps, scale=k,
         smpl_leg_length_m=smpl_leg, mmd_leg_length=skel.mean_leg_length(),
@@ -436,6 +467,8 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         fk_check_mm=motion.fk_check_mm, jitter=jitter_info,
         wrist=None if wrist is None else wrist.info,
         contacts=contacts.info,
+        wrist_limits=dict(limits.info, before_contacts={
+            k: limits_pre.info[k] for k in ('out_of_range_frames', 'changed_frames', 'max_correction_deg')}),
         twist=twist.info,
         interpolated=dict(frames=int((~valid).sum()), segments=len(gaps),
                           longest_sec=round(float(longest_gap), 3)),

@@ -20,7 +20,9 @@ hand_detect.py はランドマークモデルに入れる前に、画像から R
   * 手の存在スコアが min_presence 以上（hand_detect で体の手首から離れた所に見つかった手は、すでに 0）
   * 回し戻した 3D の点の「手首 → 中指の付け根」の画面内の向きが、画像上の 21 点の同じ向きと check_2d_deg 以内
     （ROI の戻し方が合っていること・3D の点と画像上の点が同じ手を表していることの確認）
-  * 前腕に対する手首の曲げ・ひねりが、関節として無理のない範囲（max_swing_deg・max_twist_deg）
+  * 前腕に対する手首の曲げ・ひねりが、関節として無理のない範囲（max_swing_deg・max_twist_deg）。さらに、前腕のひねり
+    （ひじ + 手首。回内・回外）と手首の曲げが、可動域（wrist_limits）から reject_margin_deg 以上外れない（手のひらの
+    表裏の取り違え等。ステージ9c の wrist_limits.py と同じ測り方）
   * NLF の手首の向きとの差が max_disagree_deg 以内（既定の 180 度では使わない）
 存在スコアを重み（min_presence で 0、full_presence 以上で 1）にして、NLF の手首のローカル回転（前腕に対する回転）に掛ける
 補正（回転ベクトル。向きは時間方向に連続につなぐ）の割合にする。見えない区間は、前後に見えたときの手首のローカル回転を
@@ -33,8 +35,10 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import filters, quat
+from .filters import rate_limit
 from .hand_detect import intrinsics
 from .motion_io import CAMERA_TO_YUP
+from .wrist_limits import hand_axes, within_limits, wrist_angles
 
 WRIST = (20, 21)
 ELBOW = (18, 19)
@@ -152,21 +156,6 @@ def _bridge_gaps(w, mask, max_len):
     return w
 
 
-def rate_limit(x, step):
-    """(T, 3) の列の 1 フレームの変化の大きさを step 以下にする。前向きと後ろ向きに掛けた結果の平均
-    （どちらも変化が step 以下なので平均も step 以下。片向きだけだと遅れる）。"""
-    def one_way(v):
-        y = np.array(v, np.float64, copy=True)
-        for t in range(1, len(y)):
-            d = y[t] - y[t - 1]
-            n = float(np.linalg.norm(d))
-            if n > step:
-                y[t] = y[t - 1] + d * (step / n)
-        return y
-    x = np.asarray(x, np.float64)
-    return 0.5 * (one_way(x) + one_way(x[::-1])[::-1])
-
-
 def continuous_rotvec(r):
     """回転ベクトルの列 (T, 3) を、同じ回転のまま時間方向に連続にする（np.unwrap の回転版）。
 
@@ -219,11 +208,12 @@ def observed_targets(analysis, rest_joints, cfg):
     return target, usable, weight, rejected
 
 
-def correct_wrists(quats, fk, rest_joints, analysis, fps, cfg):
+def correct_wrists(quats, fk, rest_joints, analysis, fps, cfg, limits=None):
     """手首のローカル回転（quats の関節 20・21）を MediaPipe の向きへ寄せる。
 
     quats: (T, 24, 4) 親に対する回転（Y 上向き。ステージ2の後）/ fk: quats → 大域回転 (T, 24, 3, 3) の関数
     analysis: hands.load_analysis の dict（world・screen・presence・roi・image_size・fps）
+    limits: 設定 wrist_limits（手首の可動域）。渡すと、可動域から cfg.reject_margin_deg より外れる向きは使わない
     戻り値: (直した quats, WristResult)
     """
     T = len(quats)
@@ -251,6 +241,11 @@ def correct_wrists(quats, fk, rest_joints, analysis, fps, cfg):
         swing, twist = swing_twist(local_t, J[HAND[s]] - J[WRIST[s]])
         ok_anat = (np.rad2deg(swing) <= float(cfg.max_swing_deg)) \
             & (np.abs(np.rad2deg(twist)) <= float(cfg.max_twist_deg))
+        if limits is not None:
+            # 前腕のひねり（ひじ + 手首）・手首の曲げが可動域から大きく外れる向き（手のひらの表裏の取り違え等）
+            ax = hand_axes(J[ELBOW[s]], J[WRIST[s]], s)
+            ok_anat &= within_limits(wrist_angles(quats[:, ELBOW[s]], local_t, ax), limits,
+                                     float(cfg.reject_margin_deg))
         ok_diff = diff <= float(cfg.max_disagree_deg)
         use = usable[:, s] & ok_anat & ok_diff
         counts['anatomy'] += int((usable[:, s] & ~ok_anat).sum())

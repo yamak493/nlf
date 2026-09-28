@@ -217,6 +217,25 @@ def test_unreliable_detections_are_not_used(body_model, case):
     assert res.info['rejected'][key] > 0
 
 
+def test_flipped_palm_targets_are_rejected_by_the_wrist_limits(body_model):
+    """MediaPipe が手のひらの表裏を取り違えた（正しい向きから前腕まわりに 180 度）向きは、前腕のひねりが可動域から
+    大きく外れるので使わない。手首だけのひねり（max_twist_deg）の確認では通ってしまう（ひじのひねりと合わせて測る）。"""
+    T = 30
+    _, true, _ = _true_and_nlf(T)
+    fk, _ = _fk(body_model, T)
+    flipped = true.copy()
+    for s in range(2):
+        axis = SMPL_REST_JOINTS[22 + s] - SMPL_REST_JOINTS[20 + s]
+        flipped[:, WRIST[s]] = quat.mul(true[:, WRIST[s]], quat.from_rotvec(_rotvec(axis, 180)))
+    a = _analysis(fk(flipped)[:, list(WRIST)], np.full((T, 2), 0.95))
+    cfg = load_config()
+    fixed, res = correct_wrists(true, fk, SMPL_REST_JOINTS, a, FPS, cfg.wrist, cfg.wrist_limits)
+    np.testing.assert_allclose(fixed, true)
+    assert res.info['rejected']['anatomy'] == 2 * T
+    _, res = correct_wrists(true, fk, SMPL_REST_JOINTS, a, FPS, cfg.wrist)
+    assert res.info['rejected']['anatomy'] == 0
+
+
 def test_anatomically_impossible_targets_are_not_used(body_model):
     """前腕に対して手首が 150 度曲がる向きは、推定の誤りとみなして使わない。"""
     T = 30
