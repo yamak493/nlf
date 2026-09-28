@@ -92,8 +92,12 @@ def find_flight(h, pelvis_y, s, e, fps, unit, cfg):
     return None
 
 
-def ground_offset(kin, fps, unit, cfg):
-    """ステージ6a。kin: 床 y=0 の座標（ステージ5 の後、MMD 単位）。unit: スケール係数。"""
+def ground_offset(kin, fps, unit, cfg, valid=None):
+    """ステージ6a。kin: 床 y=0 の座標（ステージ5 の後、MMD 単位）。unit: スケール係数。
+
+    valid: (T,) bool 人物を検出できたフレーム。False のフレーム（前後から補間しただけ）は滞空（ジャンプ）とは
+    みなさない。補間した動きには本当の上下の動きが入っていないので、常に支持あり（足を床に着ける）とする。
+    """
     lowest = lowest_foot_height(kin)
     T = len(lowest)
     window = flight_window(fps, cfg.max_flight_sec)
@@ -102,6 +106,8 @@ def ground_offset(kin, fps, unit, cfg):
     h = filters.median_time(lowest, 5)
     envelope = filters.moving_min(h, window)
     flight = h - envelope > float(cfg.flight_height_m) * unit
+    if valid is not None:
+        flight &= np.asarray(valid, bool)
     pelvis_y = filters.median_time(kin.root_pos[:, 1], 3)
     for s, e in filters.runs(flight):
         flight[s:e + 1] = False

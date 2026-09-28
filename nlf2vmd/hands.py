@@ -1,6 +1,6 @@
 """手の形（指）: MediaPipe Hands の手のランドマーク（21 点）から手の形を分けて、指ボーンのキーを作る。
 
-ノートブック（mp4_to_mannequin_ja.ipynb のセル 11）では、hand_detect.py で体の手首の位置から手を切り出して
+ノートブック（mp4_to_mannequin_ja.ipynb のセル 10）では、hand_detect.py で体の手首の位置から手を切り出して
 ランドマークを求め、hands_analysis.npz に保存する。このモジュールはそれを読んで（GPU・MediaPipe 不要）:
 
   1. 指ごとの曲げ角（人差し指〜小指は付け根・第 2・第 3 関節の曲げの和、親指は MCP・IP の和）から、
@@ -663,7 +663,7 @@ def main(argv=None):
 
     ap = argparse.ArgumentParser(
         prog='python -m nlf2vmd.hands',
-        description='ノートブックのセル 11 が保存した手のランドマークの検出結果（hands_analysis.npz）から、'
+        description='ノートブックのセル 10 が保存した手のランドマークの検出結果（hands_analysis.npz）から、'
                     '指ボーンのキー（手の形）を VMD に書き出します。')
     ap.add_argument('analysis', help='hands_analysis.npz')
     ap.add_argument('--pmx', required=True, help='モデルの .pmx（指ボーンの位置から曲げの軸を求める）')

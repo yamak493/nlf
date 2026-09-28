@@ -26,6 +26,8 @@ METRIC_LABELS = {
         'Z（奥行き）が X と同程度まで減少'),
     'lean_deg': ('前後の傾き', '接地している足の支持点の中心から全身の重心への線の、カメラの奥行き方向の傾きの中央値'
                  '（度。+ はカメラへ近づく向き。処理前はステージ6cの補正前の姿勢）', '0 に近い'),
+    'contact_overlap_frames': ('腕・指と体の重なり', '腕・手のひら・指のカプセルが、体・相手の腕と 5mm より深く重なっている'
+                               'フレーム数（処理前はステージ9bの前）', '0（contacts.enabled: false では処理前と同じ）'),
     'arm_overlap_frames': ('腕の重なり', '左右の腕のカプセル（上腕・前腕・手）が 5mm より深く重なっているフレーム数'
                            '（処理前はステージ9aの前）', '0（arm_collision.mode: none では処理前と同じ）'),
 }
@@ -145,6 +147,9 @@ def compute_metrics(r):
     if r.lean is not None and r.lean.enabled:
         m['lean_deg'] = dict(before=float(np.nanmedian(r.lean.before_deg)),
                              after=float(np.nanmedian(r.lean.after_deg)))
+    if getattr(r, 'contacts', None) is not None and r.contacts.enabled:
+        before, after = r.contacts.overlap_frames(OVERLAP_TOL_M * k)
+        m['contact_overlap_frames'] = dict(before=before, after=after)
     if r.arm_collision is not None:
         before, after = r.arm_collision.overlap_frames(OVERLAP_TOL_M * k)
         m['arm_overlap_frames'] = dict(before=before, after=after)
@@ -171,7 +176,7 @@ def format_metrics(metrics):
              ' cm/フレーム²（X, Y, Z）', 'pose_jitter_deg_per_s2': ' deg/s²',
              'foot_motion_near_floor_cm_per_frame': ' cm/フレーム（X, Z）',
              'floating_frames': ' フレーム', 'hover_frames': ' フレーム', 'lean_deg': ' 度',
-             'arm_overlap_frames': ' フレーム'}
+             'arm_overlap_frames': ' フレーム', 'contact_overlap_frames': ' フレーム'}
     lines = []
     for key, m in metrics.items():
         before = fmt(m['before']) if 'before' in m else '-'
@@ -347,6 +352,73 @@ def save_plots(r, out_dir):
         fig.tight_layout()
         paths['arm_collision'] = out_dir / 'arm_collision.png'
         fig.savefig(paths['arm_collision'], dpi=110)
+
+    # 2g. 腕・手のひら・指先と体・相手の腕の接触（部位ごとの重なりの深さの処理前後と、関節ごとの補正角）
+    if getattr(r, 'contacts', None) is not None and r.contacts.enabled:
+        from .contacts import PARTS
+        c = r.contacts
+        fig = Figure(figsize=(12, 7))
+        axes = fig.subplots(3, 1, sharex=True, gridspec_kw=dict(height_ratios=[1, 1, 0.8]))
+        tol = OVERLAP_TOL_M * 100.0
+        for side, ax in enumerate(axes[:2]):
+            before = np.clip(np.nan_to_num(c.depth_before[:, side] * cm, neginf=-1.0), 0.0, None)
+            after = np.clip(np.nan_to_num(c.depth_after[:, side] * cm, neginf=-1.0), 0.0, None)
+            n = len(PARTS)
+            img = np.concatenate([before.T, np.full((1, len(frames)), np.nan), after.T])
+            im = ax.imshow(img, aspect='auto', cmap='Reds', vmin=0.0, vmax=max(2.0, tol),
+                           interpolation='nearest', extent=(-0.5, len(frames) - 0.5, 2 * n + 0.5, -0.5))
+            ax.set_yticks(list(range(n)) + list(range(n + 1, 2 * n + 1)))
+            ax.set_yticklabels([f'before {p}' for p in PARTS] + [f'after {p}' for p in PARTS],
+                               fontsize=6)
+            b, a = (int((d[:, side] > OVERLAP_TOL_M * k).any(1).sum())
+                    for d in (c.depth_before, c.depth_after))
+            ax.set_title(f'{("left", "right")[side]} arm: overlapping frames {b} -> {a} '
+                         f'(body: {c.body_source}, {c.num_body} capsules)', fontsize=9)
+            fig.colorbar(im, ax=ax, pad=0.01, label='overlap [cm]')
+        ax = axes[2]
+        for side, ls in enumerate(('-', '--')):
+            for j, (name, color) in enumerate((('shoulder', 'tab:blue'), ('elbow', 'tab:orange'),
+                                               ('wrist', 'tab:green'))):
+                ax.plot(frames, c.correction_deg[:, side, j], color=color, ls=ls, lw=1,
+                        label=f'{("left", "right")[side]} {name}')
+        ax.set_ylabel('correction [deg]')
+        ax.set_xlabel('frame')
+        ax.legend(loc='upper right', fontsize=7, ncol=2)
+        fig.tight_layout()
+        paths['contacts'] = out_dir / 'contacts.png'
+        fig.savefig(paths['contacts'], dpi=110)
+
+    # 2f. 手首の向きの補正（MediaPipe の手のひらの向きと NLF の手首の向きの差・掛けた補正・重み）
+    if getattr(r, 'wrist', None) is not None:
+        w = r.wrist
+        fig = Figure(figsize=(12, 5))
+        axes = fig.subplots(2, 1, sharex=True)
+        for side, ax in enumerate(axes):
+            name = ('left', 'right')[side]
+            d = w.disagreement_deg[:, side]
+            ax.scatter(frames[:len(d)], d, s=4, color='0.55', label='NLF vs MediaPipe palm [deg]')
+            ax.plot(frames[:len(d)], w.correction_deg[:, side], color='tab:purple', lw=1.2,
+                    label='applied correction [deg]')
+            ax.set_ylim(0.0, 180.0)
+            ax.set_ylabel('[deg]')
+            ax2 = ax.twinx()
+            ax2.fill_between(frames[:len(d)], 0.0, w.weight[:, side], color='tab:green', alpha=0.15,
+                             lw=0, label='weight of MediaPipe')
+            ax2.set_ylim(0.0, 1.05)
+            ax2.set_ylabel('weight')
+            info = w.info[name]
+            med = info['disagreement_deg_median']
+            ax.set_title(f'{name} wrist: {info["observed_frames"]} usable frames'
+                         + ('' if med is None else
+                            f', median disagreement {med:.0f} deg, '
+                            f'> 45 deg in {info["disagreement_over_45_ratio"] * 100:.0f}%'),
+                         fontsize=10)
+            lines = ax.collections[:1] + ax.get_lines()[:1] + ax2.collections[:1]
+            ax.legend(lines, [ln.get_label() for ln in lines], loc='upper right', fontsize=8)
+        axes[-1].set_xlabel('frame')
+        fig.tight_layout()
+        paths['wrist'] = out_dir / 'wrist.png'
+        fig.savefig(paths['wrist'], dpi=110)
 
     # 3. 届く高さへのクランプの補正量
     fig = Figure(figsize=(12, 3.5))

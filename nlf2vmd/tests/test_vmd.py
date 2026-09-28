@@ -123,3 +123,30 @@ def test_thinning_keeps_forced_frames_and_accuracy():
         keep = thin_track(pos, rot, 1e-3, 0.1, forced=[20, 70])
     assert keep[[0, 20, 50, 70, T - 1]].all()
     assert keep.sum() <= 6
+
+
+def test_bezier_weight_linear_and_ease():
+    from nlf2vmd.vmd import bezier_weight
+    t = np.linspace(0.0, 1.0, 11)
+    np.testing.assert_allclose(bezier_weight(t, ((20, 20), (107, 107))), t, atol=1e-6)
+    ease = bezier_weight(t, ((40, 0), (88, 127)))
+    assert abs(ease[0]) < 1e-9 and abs(ease[-1] - 1.0) < 1e-9
+    assert ease[2] < t[2] and ease[8] > t[8] and abs(ease[5] - 0.5) < 0.01   # ゆっくり始まりゆっくり終わる
+    assert (np.diff(ease) >= 0).all()
+
+
+def test_sample_rotations_follows_keys_and_curves():
+    from nlf2vmd import quat
+    from nlf2vmd.vmd import BoneTrack, bone_interpolation, sample_rotations
+    q0, q1 = quat.IDENTITY, quat.from_rotvec([0.0, 0.0, np.pi / 2])
+    lin = BoneTrack('指', np.array([10, 20]), np.zeros((2, 3)), np.stack([q0, q1]))
+    out = sample_rotations(lin, 30)
+    assert out.shape == (30, 4)
+    np.testing.assert_allclose(out[:11], np.tile(q0, (11, 1)))
+    np.testing.assert_allclose(out[20:], np.tile(q1, (10, 1)), atol=1e-12)
+    np.testing.assert_allclose(np.rad2deg(quat.angle_between(out[15], q0)), 45.0, atol=1e-6)
+    ease = BoneTrack('指', np.array([10, 20]), np.zeros((2, 3)), np.stack([q0, q1]),
+                     np.stack([bone_interpolation(), bone_interpolation(((40, 0), (88, 127)))]))
+    out = sample_rotations(ease, 30)
+    assert np.rad2deg(quat.angle_between(out[12], q0)) < 0.2 * 90 * 0.7   # 直線より遅く始まる
+    np.testing.assert_allclose(np.rad2deg(quat.angle_between(out[15], q0)), 45.0, atol=1.0)

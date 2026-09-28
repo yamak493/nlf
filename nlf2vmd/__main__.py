@@ -18,6 +18,10 @@ def main(argv=None):
     ap.add_argument('--pmx', help='対象モデルの .pmx（脚長・ボーン位置に使う。省略時は標準ボーン）')
     ap.add_argument('--body-model', help='SMPL 体モデルの npz（省略時は入力と同じフォルダの '
                                          'smpl_body_model.npz）')
+    ap.add_argument('--hands', metavar='NPZ',
+                    help='手のランドマークの検出結果（ノートブックのセル 10 の hands_analysis.npz）。'
+                         '手首の向きを MediaPipe の手のひらの向きへ寄せ、--pmx があれば手の形（指ボーン）の'
+                         'キーも入れて、その指の形で腕・指と体の接触を解き直す')
     ap.add_argument('--config', help='設定ファイル（YAML / JSON）。書いた項目だけ既定値を上書き')
     ap.add_argument('--set', action='append', default=[], metavar='KEY=VALUE',
                     help='設定を 1 項目上書き（例: --set center.mode=B）。複数指定可')
@@ -58,14 +62,22 @@ def main(argv=None):
         ap.error('--variants は full / no_move / upper_body をカンマ区切りで指定してください: '
                  + args.variants)
     output = Path(output)
-    result = convert(source, output if 'full' in kinds else None, pmx=args.pmx,
+    result = convert(source, None, pmx=args.pmx,
                      body_model=body_model, config=args.config, overrides=overrides,
-                     diag_dir=args.diag_dir or output.with_name(output.stem + '_diag'))
+                     diag_dir=args.diag_dir or output.with_name(output.stem + '_diag'),
+                     hands_analysis=args.hands)
+    finger_tracks = []
+    if args.hands and args.pmx:
+        from .hands import make_hands
+        from .pipeline import apply_hand_poses
+        hands = make_hands(args.hands, pmx=args.pmx, config=args.config, overrides=overrides,
+                           num_frames=len(result.contact.flags))
+        finger_tracks = hands.tracks
+        apply_hand_poses(result, finger_tracks)
     for kind in kinds:
-        if kind != 'full':
-            path = output.with_name(f'{output.stem}_{kind}.vmd')
-            n = write_variant(result, kind, path)
-            print(f'{LABELS[kind]} の VMD を書き出しました: {path}（キー {n}）')
+        path = output if kind == 'full' else output.with_name(f'{output.stem}_{kind}.vmd')
+        n = write_variant(result, kind, path, bones=finger_tracks)
+        print(f'{LABELS[kind]} の VMD を書き出しました: {path}（キー {n}）')
     if result.metrics:
         print('\n評価指標（処理前 → 処理後）:')
         for line in format_metrics(result.metrics):
