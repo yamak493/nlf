@@ -168,7 +168,7 @@ def variant_tracks(result, kind, log=print):
         return []
     if result.retargeter is None or result.skeleton is None:
         raise ValueError('convert の結果に骨格の情報がありません（この版の convert で変換し直してください）')
-    args = (result.contact, result.config.vmd, result.scale)
+    args = (result.contact, result.config, result.scale)
     if kind == 'upper_body':
         return build_tracks(result.skeleton, None, None, upper_body_quats(result), *args)
     center_delta, ik, info = no_move_motion(result)

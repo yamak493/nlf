@@ -3,7 +3,7 @@
 順番を入れ替えないこと。特に「床オフセット → 接地判定 → ロック → クランプ」の順が崩れると、
 接地判定の基準がずれたり、ロック値に歪んだ値が混ざる。
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +26,7 @@ from .motion_io import load_motion
 from .pmx import PmxModel, read_pmx
 from .retarget import Retargeter
 from .skeleton import REQUIRED_BONES, SIDES, Skeleton
+from .twist import split_twist
 from .vmd import BoneTrack, sample_rotations, thin_track, to_mmd_position, to_mmd_quat, write_vmd
 from .wrist import correct_wrists
 
@@ -50,7 +51,7 @@ class ConversionResult:
     ankle_rest: np.ndarray
     reach_geometry: object
     lower_rot_raw: np.ndarray
-    local_quats: dict
+    local_quats: dict            # ボーン名 → ローカル回転（捩りボーンに分ける前。キーは build_tracks で分けて作る）
     tracks: list
     info: dict = field(default_factory=dict)
     metrics: dict = field(default_factory=dict)
@@ -64,6 +65,7 @@ class ConversionResult:
     wrist: object = None         # ステージ2b（手首の向きの補正）の結果
     contacts: object = None      # ステージ9b（腕・手のひら・指先と体・相手の腕の接触）の結果
     local_before_contacts: dict = None   # ステージ9b の前のローカル回転（指の形を入れて 9b をやり直すのに使う）
+    twist: object = None         # 捩りボーンへのひねりの振り分け（twist.TwistResult）
     smpl_rest: np.ndarray = None  # SMPL の初期姿勢の関節（体型を固定したもの）
     skeleton: object = None      # 対象モデルの骨格（variants.py で種類別のキーを作り直すのに使う）
     retargeter: object = None
@@ -114,11 +116,14 @@ def apply_scale(kin, k, depth_scale):
     return kin
 
 
-def build_tracks(skel, center_delta, ik, local, contact, cfg_vmd, unit):
-    """VMD のキー列を作る（MMD 座標へ変換し、必要なら間引く）。
+def build_tracks(skel, center_delta, ik, local, contact, cfg, unit):
+    """VMD のキー列を作る（捩りボーンへひねりを分け、MMD 座標へ変換し、必要なら間引く）。
 
+    local: ボーン名 → ローカル回転（捩りボーンに分ける前。ここで cfg.twist に従って分ける）
     center_delta / ik が None なら、センター・グルーブ / 足ＩＫのキーは打たない。
     """
+    cfg_vmd = cfg.vmd
+    local = split_twist(skel, local, cfg.twist).local
     T = len(contact.flags)
     frames = np.arange(T)
     identity = np.tile(quat.IDENTITY, (T, 1))
@@ -167,6 +172,16 @@ def log_contacts(contacts, unit, log, label='[9b]'):
         + f' / 補正 最大 肩 {corr["shoulder"]:.1f}・ひじ {corr["elbow"]:.1f}・手首 {corr["wrist"]:.1f} 度')
 
 
+def log_twist(twist, log):
+    if log is None or not twist.enabled:
+        return
+    if twist.chains:
+        log('[10] 捩りボーン: ' + ' / '.join(f'{name} 最大 {deg:.0f} 度'
+                                        for name, deg in twist.info['max_deg'].items()))
+    for note in twist.skipped:
+        log(f'[10] {note}')
+
+
 def apply_hand_poses(result, hand_tracks, log=print):
     """指のキー（hands.make_hands の tracks）を入れた指の形で、ステージ9b（接触の解決）をやり直す。
 
@@ -184,9 +199,11 @@ def apply_hand_poses(result, hand_tracks, log=print):
         result.fps, result.smpl_rest, finger_local=finger_local)
     result.local_quats = local
     result.contacts = contacts
+    result.twist = split_twist(result.skeleton, local, cfg.twist)
     result.tracks = build_tracks(result.skeleton, result.center.delta, result.foot_ik, local,
-                                 result.contact, cfg.vmd, result.scale)
+                                 result.contact, cfg, result.scale)
     result.info['contacts'] = contacts.info
+    result.info['twist'] = result.twist.info
     log_contacts(contacts, result.scale, log, label='[9b 指の形を入れて]')
     return contacts
 
@@ -247,9 +264,15 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
             warn('体モデルと入力の関節位置が一致しません。体モデルのファイルを確認してください')
 
     # ---- 2. 姿勢のジッター制御 ----
-    quats, jitter_info = stabilize_pose(motion.quats, fps, cfg.jitter)
+    rest_joints = bm.rest_joints(motion.betas)
+    quats, jitter_info = stabilize_pose(motion.quats, fps, cfg.jitter, rest_joints)
     root = stabilize_root(motion.root_pos, cfg.jitter.root_median_window)
-    log(f'[2] ジッター制御: 外れ値として置き換えたフレーム {jitter_info["outlier_frames"]}')
+    hold = ''
+    if 'hand_hold_ratio' in jitter_info:
+        left, right = (v * 100.0 for v in jitter_info['hand_hold_ratio'])
+        hold = (f' / 手首の位置の軌跡に合わせたフレーム 左 {left:.0f}%・右 {right:.0f}%'
+                f'（肩・ひじの補正 最大 {jitter_info["hand_hold_max_deg"]:.1f} 度）')
+    log(f'[2] ジッター制御: 外れ値として置き換えたフレーム {jitter_info["outlier_frames"]}' + hold)
 
     # ---- 2b. 手首の向きの補正（MediaPipe Hands） ----
     wrist = None
@@ -260,8 +283,6 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
             warn('手の検出結果に ROI・画像の大きさが無いので、手首の向きは補正しません'
                  '（ノートブックのセル 10 で検出し直してください）')
         else:
-            rest_joints = bm.rest_joints(motion.betas)
-
             def fk(q):
                 return forward_kinematics(q, root, rest_joints, bm.parents)[0]
 
@@ -309,6 +330,8 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     # 2 回目以降は、奥行きを補正した体でもう一度接地を判定する（両足が同時に前後へ動いて見えて
     # 判定から漏れたフレームを拾い、その区間も含めて奥行きを求め直す）。奥行きの軸は床の傾きを補正すると
     # 上下の成分を持つので、接地の拘束は奥行きを補正した体に毎回掛け直す。
+    # 接地の拘束は、最初（接地判定の前）は両足の最下点から、接地判定の後は接地している足の高さだけから求める
+    # （遊脚の足先が床より下に見えても体全体を上下させない）。
     # 前後の傾きは 1 回目の接地判定のあとに 1 度だけ求める。足首から下は動かさないので接地判定は変わらず、
     # 奥行きの再構成は傾きを補正した足首→骨盤の相対位置を使う（平滑化する前の姿勢にも同じ補正を掛ける）
     axis = depth_axis(floor.rotation)
@@ -324,9 +347,12 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
             kin, kin_pose = lean.apply(kin), lean.apply(kin_raw)
         depth = reconstruct_depth(kin, kin_pose, contact, axis, fps, k, cfg.depth, valid)
         moved = depth.apply(kin)
-        ground = ground_offset(moved, fps, k, cfg.ground, valid)
+        ground = ground_offset(moved, fps, k, cfg.ground, valid, contact)
         judged = ground.apply(moved)
     kin = judged
+    # 接地判定の高さを最後の体の高さにする（足ＩＫの床への吸着は、同じ体の「足首 − 足裏」の高さを使う。
+    # 判定した体のままだと、最後の接地の拘束・奥行きの補正で動いた分だけ、接地中の足が浮く・埋まる）
+    contact = replace(contact, heights=np.asarray(kin.contact_points)[..., 1])
     if ground.enabled:
         log(f'[6a] 接地の拘束: 上下の補正 {-ground.offset.max() / k * 100:.1f} 〜 '
             f'{-ground.offset.min() / k * 100:.1f} cm / ジャンプとして残した区間 '
@@ -385,8 +411,10 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
                                        cfg.hands.bones, cfg.arm_collision.mode, k, fps, rest.joints)
     log_contacts(contacts, k, log)
 
-    # ---- 10. VMD 書き出しと診断出力 ----
-    tracks = build_tracks(skel, center.delta, ik, local, contact, cfg.vmd, k)
+    # ---- 10. 捩りボーンへのひねりの振り分け（キーは build_tracks が同じように分けて作る）・VMD 書き出しと診断出力 ----
+    twist = split_twist(skel, local, cfg.twist)
+    log_twist(twist, log)
+    tracks = build_tracks(skel, center.delta, ik, local, contact, cfg, k)
     model_name = cfg.vmd.model_name or skel.model_name or 'nlf2vmd'
     n_keys = 0
     if out_path is not None:
@@ -400,7 +428,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         ik, center, ankle_rest, geom, rt.global_matrix('下半身', kin_raw.glob_rot), local, tracks,
         warnings=warns, depth=depth, ground=ground, lean=lean, arm_collision=arms, skeleton=skel,
         retargeter=rt, wrist=wrist, contacts=contacts, local_before_contacts=local_before_contacts,
-        smpl_rest=rest.joints)
+        twist=twist, smpl_rest=rest.joints)
     result.info = dict(
         frames=motion.num_frames, fps=fps, source_fps=motion.source_fps, scale=k,
         smpl_leg_length_m=smpl_leg, mmd_leg_length=skel.mean_leg_length(),
@@ -408,6 +436,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         fk_check_mm=motion.fk_check_mm, jitter=jitter_info,
         wrist=None if wrist is None else wrist.info,
         contacts=contacts.info,
+        twist=twist.info,
         interpolated=dict(frames=int((~valid).sum()), segments=len(gaps),
                           longest_sec=round(float(longest_gap), 3)),
         floor=dict(tilt_deg=floor.tilt_deg, tilt_applied=floor.tilt_applied,

@@ -482,6 +482,7 @@ def test_stabilized_joints_camera_coords(body_model):
 
     # ジッター制御を無効にすると、入力をそのまま FK した位置（カメラ座標 [mm]）と一致する
     off = ['jitter.outlier_deg_per_s=1e9', 'jitter.root_median_window=1',
+           'jitter.hand_position.enabled=false',
            *[f'jitter.one_euro.groups.{g}.min_cutoff=0'
              for g in ('torso', 'head', 'arm', 'wrist', 'leg')]]
     joints = hd.stabilized_joints(motion, body_model, overrides=off)

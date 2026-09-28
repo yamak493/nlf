@@ -1,5 +1,7 @@
-"""フィルタ: 震えが減り遅延が許容内であること。クォータニオンの符号反転で跳ねないこと。"""
+"""フィルタ: 震えが減り遅延が許容内であること。クォータニオンの符号反転で跳ねないこと。
+腕: 手首が止まっている間は手首の位置の軌跡に合わせ、速く動く腕は関節ごとの平滑化のままにすること。"""
 import numpy as np
+import pytest
 
 from nlf2vmd import load_config, quat
 from nlf2vmd.filters import gaussian_time, moving_min, one_euro
@@ -92,3 +94,109 @@ def test_moving_min_then_limited_gaussian_never_exceeds_required():
     required = np.minimum(0.0, rng.normal(0, 1, 300))
     out = gaussian_time(moving_min(required, 9), 2.0, radius=4)
     assert (out <= required + 1e-12).all()
+
+
+def _hand_on_chest(T=240, noise_deg=2.0, seed=0):
+    """両手を胸の前（背骨3 の座標系で固定の点）に置いたまま、鎖骨を上下させ（肩をすくめる）、ひじを肩 → 手首の軸
+    まわりに振る（ひじを張る）動き。関節は大きく動くが手首は止まっている。戻り値: (正解の回転, 震えを足した回転)。"""
+    from nlf2vmd.jitter import ARM_CHAINS
+    from nlf2vmd.synthetic import SMPL_REST_JOINTS as J
+    rng = np.random.default_rng(seed)
+    t = np.arange(T) / FPS
+    q = np.tile(quat.IDENTITY, (T, 24, 1))
+    for side, (spine, collar, shoulder, elbow, wrist) in enumerate(ARM_CHAINS):
+        sign = 1.0 if side == 0 else -1.0
+        target = np.array([0.05 * sign, -0.05, 0.3])
+        shrug = sign * 0.25 * np.sin(2 * np.pi * 1.5 * t)
+        q[:, collar] = quat.from_rotvec(np.stack([0 * t, 0 * t, shrug], axis=1))
+        swivel = np.deg2rad(35.0) * np.sin(2 * np.pi * 1.2 * t + side)
+        upper, fore = J[elbow] - J[shoulder], J[wrist] - J[elbow]
+        lu, lf = np.linalg.norm(upper), np.linalg.norm(fore)
+        hinge = np.cross(upper, [0.0, 0.0, 1.0]) * sign
+        hinge /= np.linalg.norm(hinge)
+        for i in range(T):
+            Rc = quat.to_matrix(q[i, collar])
+            goal = Rc.T @ (target - (J[collar] - J[spine]) - Rc @ (J[shoulder] - J[collar]))
+            d = np.linalg.norm(goal)
+            bend = np.arccos(np.clip((d ** 2 - lu ** 2 - lf ** 2) / (2 * lu * lf), -1.0, 1.0))
+            q[i, elbow] = quat.from_rotvec(hinge * bend)
+            reach = quat.from_two_vectors(upper + quat.rotate(q[i, elbow], fore), goal)
+            q[i, shoulder] = quat.mul(quat.from_rotvec(goal / d * swivel[i]), reach)
+    clean = quat.make_continuous(q)
+    return clean, _add_arm_noise(clean, noise_deg, rng)
+
+
+def _add_arm_noise(q, noise_deg, rng):
+    """鎖骨・肩・ひじ・手首の回転に、フレームごとの震え（標準偏差 noise_deg 度）を足す。"""
+    noisy = q.copy()
+    for j in (13, 14, 16, 17, 18, 19, 20, 21):
+        shake = quat.from_rotvec(rng.normal(0, np.deg2rad(noise_deg), (len(q), 3)))
+        noisy[:, j] = quat.mul(noisy[:, j], shake)
+    return noisy
+
+
+def _swinging_arms(T=240, noise_deg=2.0, seed=0):
+    """肩とひじを別の速さで大きく振る（手首が速く動く）動き。"""
+    rng = np.random.default_rng(seed)
+    t = np.arange(T) / FPS
+    q = np.tile(quat.IDENTITY, (T, 24, 1))
+    zero = np.zeros(T)
+    for side, sign in enumerate((1.0, -1.0)):
+        swing = 0.8 * np.sin(2 * np.pi * 1.5 * t + side)
+        bend = sign * (1.0 + 0.8 * np.sin(2 * np.pi * 0.7 * t))
+        q[:, 16 + side] = quat.from_rotvec(np.stack([swing, zero, zero - sign], axis=1))
+        q[:, 18 + side] = quat.from_rotvec(np.stack([zero, bend, zero], axis=1))
+    clean = quat.make_continuous(q)
+    return clean, _add_arm_noise(clean, noise_deg, rng)
+
+
+def _hand_errors(clean, q):
+    """(左右の手首の、正解からの位置のずれの平均 [cm], 手首の位置の 2 階差分の平均 [cm])。"""
+    from nlf2vmd.jitter import ARM_CHAINS, hand_positions
+    from nlf2vmd.synthetic import SMPL_REST_JOINTS as J
+    err, jit = [], []
+    for chain in ARM_CHAINS:
+        h = hand_positions(q, J, chain)
+        err.append(np.linalg.norm(h - hand_positions(clean, J, chain), axis=-1)[10:-10].mean())
+        jit.append(np.linalg.norm(np.diff(h, 2, axis=0), axis=-1).mean())
+    return np.mean(err) * 100.0, np.mean(jit) * 100.0
+
+
+def _arm_smoothing(noisy, enabled):
+    from nlf2vmd.synthetic import SMPL_REST_JOINTS as J
+    cfg = load_config(overrides=[f'jitter.hand_position.enabled={str(enabled).lower()}']).jitter
+    return stabilize_pose(noisy, FPS, cfg, J)
+
+
+@pytest.mark.parametrize('seed', [0, 1, 2])
+def test_resting_hand_is_held_while_the_arm_joints_move(seed):
+    """胸の前に置いた手（関節は動くが手首は止まっている）は、関節ごとの平滑化より手首が正解に近く、揺れも小さい。"""
+    clean, noisy = _hand_on_chest(seed=seed)
+    err_off, jit_off = _hand_errors(clean, _arm_smoothing(noisy, False)[0])
+    q, info = _arm_smoothing(noisy, True)
+    err_on, jit_on = _hand_errors(clean, q)
+    assert min(info['hand_hold_ratio']) > 0.9
+    assert err_on < 0.92 * err_off
+    assert jit_on < 0.85 * jit_off
+
+
+def test_fast_hands_keep_the_per_joint_smoothing():
+    """手首が速く動く腕は、関節ごとの平滑化とほぼ同じ（位置の軌跡の平滑化で動きが小さくならない）。"""
+    clean, noisy = _swinging_arms()
+    err_off, jit_off = _hand_errors(clean, _arm_smoothing(noisy, False)[0])
+    err_on, jit_on = _hand_errors(clean, _arm_smoothing(noisy, True)[0])
+    assert err_on < 1.05 * err_off
+    assert jit_on < 1.05 * jit_off
+
+
+def test_holding_the_hand_keeps_its_orientation_and_other_joints():
+    """手首の位置に合わせても、手の向き（背骨3 に対する手首の大域回転）と、腕以外の関節は変えない。"""
+    clean, noisy = _hand_on_chest(T=90, seed=3)
+    off, _ = _arm_smoothing(noisy, False)
+    on, _ = _arm_smoothing(noisy, True)
+    for collar, shoulder, elbow, wrist in ((13, 16, 18, 20), (14, 17, 19, 21)):
+        chain = lambda q: quat.mul(quat.mul(q[:, collar], q[:, shoulder]),  # noqa: E731
+                                   quat.mul(q[:, elbow], q[:, wrist]))
+        assert np.rad2deg(quat.angle_between(chain(off), chain(on))).max() < 1e-4
+    others = [j for j in range(24) if j not in (16, 17, 18, 19, 20, 21)]
+    np.testing.assert_allclose(on[:, others], off[:, others], atol=1e-12)

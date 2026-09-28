@@ -275,6 +275,9 @@ def save_plots(r, out_dir):
         _bands(ax, hover_mask(r, 0.02 * k), 'tab:red', alpha=0.35)
         ax.plot(frames, r.ground.lowest * cm, color='0.6', lw=1,
                 label='lowest foot point: before (smoothed pose)')
+        if r.ground.height is not None:
+            ax.plot(frames, r.ground.height * cm, color='tab:green', lw=0.8,
+                    label='height used: planted feet (lowest point if none)')
         ax.plot(frames, lowest_foot_height(r.kin) * cm, color='tab:red', lw=1.2,
                 label='lowest foot point: after')
         if r.ground.enabled:

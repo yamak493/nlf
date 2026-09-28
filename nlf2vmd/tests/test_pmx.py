@@ -39,7 +39,7 @@ DEFAULT_VERTICES = [((0.0, 0.0, 0.0), 0, (0,), ()), ((0.0, 0.0, 0.0), 1, (0, 1),
 
 
 def make_pmx(bones, enc=0, bsize=2, n_uv=1, vertices=None):
-    """最小限の PMX 2.0。bones: [(名前, 位置, 親の番号, 表示先の番号 or None, IK か)]
+    """最小限の PMX 2.0。bones: [(名前, 位置, 親の番号, 表示先の番号 or None, IK か[, 軸制限の軸])]
     vertices: [(位置, 変形方式 0〜3, ボーンの番号, ウェイト)]（3 つ以上。既定は DEFAULT_VERTICES）"""
     out = b'PMX ' + struct.pack('<f', 2.0) + bytes([8, enc, n_uv, 2, 1, 1, bsize, 1, 1])
     out += _text('テストモデル', enc) + _text('test', enc) + _text('', enc) + _text('', enc)
@@ -61,11 +61,14 @@ def make_pmx(bones, enc=0, bsize=2, n_uv=1, vertices=None):
     out += struct.pack('<bb', 0, -1) + bytes([0]) + bytes([1, 0]) + _text('memo', enc)
     out += struct.pack('<i', 3)
     out += struct.pack('<i', len(bones))
-    for name, pos, parent, tail, is_ik in bones:
-        flags = 0x0002 | 0x0008 | (0x0001 if tail is not None else 0) | (0x0020 if is_ik else 0)
+    for name, pos, parent, tail, is_ik, *axis in bones:
+        flags = (0x0002 | 0x0008 | (0x0001 if tail is not None else 0) | (0x0020 if is_ik else 0)
+                 | (0x0400 if axis else 0))
         out += _text(name, enc) + _text('', enc) + struct.pack('<3f', *pos)
         out += struct.pack(f'<{bi}iH', parent, 0, flags)
         out += struct.pack(f'<{bi}', tail) if tail is not None else struct.pack('<3f', 0, 1, 0)
+        if axis:
+            out += struct.pack('<3f', *axis[0])
         if is_ik:
             out += struct.pack(f'<{bi}if', 0, 40, 2.0) + struct.pack('<i', 2)
             out += struct.pack(f'<{bi}B', 1, 1) + struct.pack('<6f', *[0.0] * 6)
@@ -98,6 +101,24 @@ def test_read_bones(tmp_path, enc, bsize):
     assert skel.nearest_ancestor('左ひじ', {'左肩', '上半身2'}) == '左肩'
     assert abs(skel.mean_leg_length() - Skeleton.standard().mean_leg_length()) < 1e-5
     assert model.morphs == []     # モーフの部分が無いファイル
+
+
+def test_read_fixed_axis(tmp_path):
+    """軸制限（捩りボーン）の軸を読み、骨格に持たせる。軸制限の無いボーンは None。"""
+    bones = standard_pmx_bones()
+    names = [b[0] for b in bones]
+    arm, elbow = (np.array(STANDARD_BONES[n][0]) for n in ('左腕', '左ひじ'))
+    axis = tuple((elbow - arm) / np.linalg.norm(elbow - arm))
+    bones.append(('左腕捩', tuple(0.5 * (arm + elbow)), names.index('左腕'), None, False, axis))
+    path = tmp_path / 'm.pmx'
+    path.write_bytes(make_pmx(bones))
+    model = read_pmx(path)
+    np.testing.assert_allclose(model.bones[-1].fixed_axis, axis, atol=1e-6)
+    assert all(b.fixed_axis is None for b in model.bones[:-1])
+    skel = Skeleton.from_pmx(model)
+    np.testing.assert_allclose(skel.axis_internal('左腕捩'), np.array(axis) * [1.0, 1.0, -1.0],
+                               atol=1e-6)
+    assert skel.axis_internal('左腕') is None
 
 
 @pytest.mark.parametrize('enc,bsize', [(0, 2), (1, 4)])

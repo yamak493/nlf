@@ -6,8 +6,15 @@
 床の高さの補正（ステージ4）はシーケンス全体の定数なので、このずれは残り、両足が床から浮いた状態
 （または埋まった状態）が数秒続く。浮いている間は接地判定からも漏れるので、足もロックされない。
 
-人は重力に逆らって長く宙に浮いていられない（ジャンプの滞空は長くても 0.6 秒程度）。そこで、両足の
-最下点の高さ h(t)（かかと・つま先の低いほう）から上下のずれを求め、体全体を上下に平行移動して打ち消す。
+人は重力に逆らって長く宙に浮いていられない（ジャンプの滞空は長くても 0.6 秒程度）。そこで、足の高さ h(t)
+から上下のずれを求め、体全体を上下に平行移動して打ち消す。
+
+h(t) は、接地判定（ステージ6）の結果があれば、接地している足のかかと・つま先の最も低い点の高さにする。
+接地していない足（遊脚・床を擦って動かしている足）の足先が、向きの推定のぶれで床より下に見えても、体全体は
+上下しない。両足とも接地していれば低いほうの足にする（離れ始めた足は、接地判定のヒステリシスで高さ 5cm までは
+接地のまま続くので、平均すると上がっていく足に引っ張られる）。接地している足が無いフレームと、接地判定の前
+（1 回目）は、両足の最下点にする（ゆっくり浮き上がった区間は接地判定から漏れるので、そこを前後の接地から
+補間すると浮きが残る）。
 
 1. h のメディアン（窓幅 5）で、1〜2 フレームだけ足が床の下へ飛ぶ推定の破綻を除く
 2. 移動最小値（窓幅は最長の滞空時間より長い）で「下側の包絡線」を作る。ジャンプの区間も、窓の中に
@@ -42,6 +49,7 @@ class GroundResult:
     flight: np.ndarray       # (T,) bool ジャンプとして残した滞空のフレーム
     window: int              # 移動最小値の窓幅 [フレーム]
     enabled: bool
+    height: np.ndarray = None  # (T,) 上下のずれを求めた足の高さ（support_height。補正前）
 
     def apply(self, kin):
         if not self.enabled:
@@ -55,6 +63,23 @@ def lowest_foot_height(kin):
     """(T,) 両足のかかと・つま先のうち、最も低い点の高さ。"""
     h = np.asarray(kin.contact_points)[..., 1]
     return h.reshape(len(h), -1).min(axis=1)
+
+
+def support_height(kin, contact=None):
+    """(T,) 上下のずれを求める足の高さ。
+
+    contact（ステージ6 の接地判定）があれば、接地している足のかかと・つま先のうち最も低い点の高さ。接地している足が
+    無いフレームと、contact が無いときは、両足の最下点。
+    """
+    lowest = lowest_foot_height(kin)
+    if contact is None:
+        return lowest
+    flags = np.asarray(contact.flags, bool)
+    sole = np.asarray(kin.contact_points)[..., 1].min(-1)       # (T, 2) 足ごとの低いほう
+    on = flags.any(1)
+    h = lowest.copy()
+    h[on] = np.where(flags, sole, np.inf).min(1)[on]
+    return h
 
 
 def flight_window(fps, max_flight_sec):
@@ -92,18 +117,22 @@ def find_flight(h, pelvis_y, s, e, fps, unit, cfg):
     return None
 
 
-def ground_offset(kin, fps, unit, cfg, valid=None):
+def ground_offset(kin, fps, unit, cfg, valid=None, contact=None):
     """ステージ6a。kin: 床 y=0 の座標（ステージ5 の後、MMD 単位）。unit: スケール係数。
 
     valid: (T,) bool 人物を検出できたフレーム。False のフレーム（前後から補間しただけ）は滞空（ジャンプ）とは
     みなさない。補間した動きには本当の上下の動きが入っていないので、常に支持あり（足を床に着ける）とする。
+    contact: ステージ6 の接地判定（kin の足と同じフレーム・同じ足）。あれば、接地している足の高さだけから
+    上下のずれを求める（support_height）。滞空かどうかは骨盤の動きで決める（踏み切り・着地の数フレームは、接地判定の
+    ヒステリシスで接地が続いていることがあるため、接地判定では決めない）。
     """
     lowest = lowest_foot_height(kin)
     T = len(lowest)
     window = flight_window(fps, cfg.max_flight_sec)
+    height = support_height(kin, contact)
     if not cfg.enabled or T == 0:
-        return GroundResult(lowest, np.zeros(T), np.zeros(T, bool), window, False)
-    h = filters.median_time(lowest, 5)
+        return GroundResult(lowest, np.zeros(T), np.zeros(T, bool), window, False, height)
+    h = filters.median_time(height, 5)
     envelope = filters.moving_min(h, window)
     flight = h - envelope > float(cfg.flight_height_m) * unit
     if valid is not None:
@@ -117,7 +146,7 @@ def ground_offset(kin, fps, unit, cfg, valid=None):
     t = np.arange(T)
     offset = np.interp(t, t[~flight], h[~flight]) if (~flight).any() else envelope
     offset = filters.gaussian_time(offset, float(cfg.smooth_sec) * fps)
-    return GroundResult(lowest, offset, flight, window, True)
+    return GroundResult(lowest, offset, flight, window, True, height)
 
 
 def floating_frames(lowest, fps, height, max_flight_sec):

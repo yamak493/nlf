@@ -42,10 +42,12 @@ SIDES = ('左', '右')
 
 class Skeleton:
     def __init__(self, positions, parents, tails, model_name='', source='standard',
-                 mesh_points=None, mesh_bones=None, rigid_bodies=None):
+                 mesh_points=None, mesh_bones=None, rigid_bodies=None, axes=None):
         self.positions = {k: np.asarray(v, np.float64) for k, v in positions.items()}
         self.parents = dict(parents)
         self.tails = {k: np.asarray(v, np.float64) for k, v in tails.items() if v is not None}
+        # 軸制限のあるボーン（腕捩・手捩など）の軸（MMD 座標）
+        self.axes = {k: np.asarray(v, np.float64) for k, v in (axes or {}).items()}
         self.model_name = model_name
         self.source = source
         # PMX の頂点（MMD 座標）と、そのウェイトが最も大きいボーンの名前。標準ボーンでは None
@@ -63,12 +65,14 @@ class Skeleton:
 
     @classmethod
     def from_pmx(cls, model):
-        pos, par, tails = {}, {}, {}
+        pos, par, tails, axes = {}, {}, {}, {}
         for b in model.bones:
             if b.name in pos:
                 continue   # 同名ボーンは最初のものを使う（MMD と同じ）
             pos[b.name] = b.position
             par[b.name] = model.bones[b.parent].name if 0 <= b.parent < len(model.bones) else None
+            if b.fixed_axis is not None:
+                axes[b.name] = b.fixed_axis
             if b.flags & 0x0001:
                 if 0 <= b.tail_index < len(model.bones):
                     tails[b.name] = model.bones[b.tail_index].position
@@ -87,7 +91,7 @@ class Skeleton:
                            rotation=np.asarray(rb.rotation, np.float64), mode=int(rb.mode),
                            bone=model.bones[rb.bone].name if 0 <= rb.bone < len(model.bones) else None)
                       for rb in model.rigid_bodies]
-        return cls(pos, par, tails, model.name, 'pmx', points, bones, rigids)
+        return cls(pos, par, tails, model.name, 'pmx', points, bones, rigids, axes)
 
     def has(self, name):
         return name in self.positions
@@ -98,6 +102,10 @@ class Skeleton:
 
     def tail_internal(self, name):
         return self.tails[name] * MMD_TO_INTERNAL if name in self.tails else None
+
+    def axis_internal(self, name):
+        """軸制限の軸（内部座標）。軸制限の無いボーンは None。"""
+        return self.axes[name] * MMD_TO_INTERNAL if name in self.axes else None
 
     def missing(self, names):
         return [n for n in names if not self.has(n)]

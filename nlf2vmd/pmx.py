@@ -20,6 +20,7 @@ class PmxBone:
     flags: int
     tail_index: int           # 表示先がボーン指定のとき、その番号（-1 = なし）
     tail_offset: np.ndarray   # 表示先が相対位置指定のとき、その値
+    fixed_axis: np.ndarray = None   # 軸制限（捩りボーンなど）の軸（MMD 座標）。無ければ None
 
 
 @dataclass
@@ -157,7 +158,7 @@ def read_pmx(path):
         parent = r.index(bsize)
         r.i32()                  # 変形階層
         flags = r.unpack('H')[0]
-        tail_index, tail_offset = -1, np.zeros(3)
+        tail_index, tail_offset, fixed_axis = -1, np.zeros(3), None
         if flags & 0x0001:
             tail_index = r.index(bsize)
         else:
@@ -166,7 +167,7 @@ def read_pmx(path):
             r.index(bsize)
             r.f32()
         if flags & 0x0400:              # 軸固定
-            r.vec(3)
+            fixed_axis = r.vec(3)
         if flags & 0x0800:              # ローカル軸
             r.vec(6)
         if flags & 0x2000:              # 外部親変形
@@ -179,7 +180,8 @@ def read_pmx(path):
                 r.index(bsize)
                 if r.u8():
                     r.vec(6)
-        bones.append(PmxBone(bname, bname_en, pos, parent, flags, tail_index, tail_offset))
+        bones.append(PmxBone(bname, bname_en, pos, parent, flags, tail_index, tail_offset,
+                             fixed_axis))
 
     # ---- モーフ（読めなくてもボーンは使えるので、失敗したら None にする） ----
     morphs = []

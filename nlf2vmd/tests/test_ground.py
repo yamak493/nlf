@@ -2,8 +2,9 @@
 import numpy as np
 import pytest
 
-from nlf2vmd import convert, load_config
+from nlf2vmd import convert, ground, load_config, quat
 from nlf2vmd.body_model import Kinematics
+from nlf2vmd.contact import ContactResult
 from nlf2vmd.diagnostics import hover_mask
 from nlf2vmd.filters import runs
 from nlf2vmd.ground import flight_window, floating_frames, ground_offset, lowest_foot_height
@@ -173,3 +174,86 @@ def test_noisy_feet_do_not_create_fake_jumps(tmp_path, body_model):
     assert not r.ground.flight[~near_jump].any()
     assert r.ground.flight[air].sum() >= 0.7 * air.sum()
     assert hover_mask(r, 0.02 * r.scale)[~near_jump].sum() <= 5
+
+
+def _feet_kin(heights, pelvis_y=0.9):
+    """足ごとの高さ heights (T, 2)（かかと・つま先とも同じ高さ）と骨盤の高さだけを持つ Kinematics。"""
+    heights = np.asarray(heights, np.float64)
+    T = len(heights)
+    joints = np.zeros((T, 24, 3))
+    joints[:, 0, 1] = pelvis_y
+    pts = np.zeros((T, 2, 2, 3))
+    pts[..., 1] = heights[:, :, None]
+    return Kinematics(np.tile(np.eye(3), (T, 24, 1, 1)), joints, pts)
+
+
+def _contact(flags):
+    flags = np.asarray(flags, bool)
+    T = len(flags)
+    return ContactResult(flags, [runs(flags[:, f]) for f in range(2)], np.zeros((T, 2, 2)),
+                         np.zeros((T, 2, 2)))
+
+
+def test_only_planted_feet_set_the_height():
+    """左足が床に着いたまま、右足（遊脚）の足先が向きのぶれで 4cm 床の下に見えても、体全体は上下しない。
+    両足とも接地していれば低いほうの足に合わせ、接地している足が無いフレームは両足の最下点に合わせる。"""
+    cfg = load_config().ground
+    T = 200
+    heights = np.zeros((T, 2))
+    heights[:, 1] = 0.06
+    dip = slice(60, 75)
+    heights[dip, 1] = -0.04
+    flags = np.zeros((T, 2), bool)
+    flags[:, 0] = True
+    kin = _feet_kin(heights)
+    assert ground_offset(kin, FPS, 1.0, cfg).offset[dip].min() < -0.03    # 両足の最下点では体が持ち上がる
+    g = ground_offset(kin, FPS, 1.0, cfg, contact=_contact(flags))
+    assert np.abs(g.offset).max() < 1e-9
+    np.testing.assert_allclose(g.height, 0.0)
+    np.testing.assert_allclose(g.lowest[dip], -0.04)                     # 最下点（診断用）はそのまま
+
+    heights[120:140] = [0.02, 0.01]                                      # 両足とも接地: 低いほう
+    flags[120:140] = True
+    heights[160:170] = [0.05, 0.04]                                      # どちらも接地していない: 最下点
+    flags[160:170] = False
+    h = ground.support_height(_feet_kin(heights), _contact(flags))
+    np.testing.assert_allclose(h[120:140], 0.01)
+    np.testing.assert_allclose(h[160:170], 0.04)
+
+
+def _drag_feet(motion, pitch_deg):
+    """遊脚の間だけ、足首をつま先が下がる向きに最大 pitch_deg 度回す（足を床に擦って動かすと、足先が床の下に見える）。"""
+    q = quat.from_rotvec(np.asarray(motion['pose'], float))
+    t = np.arange(len(q)) / float(motion['fps'])
+    # 遊脚の始まりと終わりは 0（synthetic_walk の 1 歩は 0.6 秒）
+    envelope = np.sin(np.pi * ((t / 0.6) % 1.0)) ** 2
+    for side in range(2):
+        angle = np.deg2rad(pitch_deg) * envelope * ~motion['stance'][:, side]
+        q[:, 7 + side] = quat.mul(q[:, 7 + side],
+                                  quat.from_rotvec(angle[:, None] * [1.0, 0.0, 0.0]))
+    return dict(motion, pose=quat.to_rotvec(q))
+
+
+def test_dragged_foot_does_not_move_the_body(tmp_path, body_model, monkeypatch):
+    """足を床に擦って前へ出す歩き方（遊脚が床の高さのまま速く動くので接地にならない）で、遊脚の足先が 4cm 床の下に
+    見えても、骨盤の高さ（グルーブ）は足先が下がらない推定と変わらず、支持脚は床に着いたまま。"""
+    walk = synthetic_walk(num_frames=300, speed=0.6, lift=0.0)
+    clean = _convert(tmp_path, body_model, walk, (), 'clean.vmd')
+    r = _convert(tmp_path, body_model, _drag_feet(walk, 15.0), (), 'drag.vmd')
+
+    def center_shift_cm(res):
+        return np.abs(res.center.delta[:, 1] - clean.center.delta[:, 1]).max() / res.scale * 100.0
+
+    assert center_shift_cm(r) < 0.3
+    assert _stance_ik_height_cm(walk, r) < 1.0
+    # 両足の最下点で合わせる（接地判定を使わない）と、遊脚の足先に引っ張られて体全体が上下する
+    monkeypatch.setattr(ground, 'support_height',
+                        lambda kin, contact=None: lowest_foot_height(kin))
+    before = _convert(tmp_path, body_model, _drag_feet(walk, 15.0), (), 'before.vmd')
+    assert center_shift_cm(before) > 1.0
+
+
+def test_contact_heights_match_the_final_body(run_walk):
+    """足ＩＫの床への吸着が使う接地点の高さは、接地の拘束・奥行きの補正を掛け終えた体のもの。"""
+    _, r = run_walk(num_frames=120)
+    np.testing.assert_allclose(r.contact.heights, r.kin.contact_points[..., 1])

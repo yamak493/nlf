@@ -183,9 +183,10 @@ def stabilized_joints(source, body_model, config=None, overrides=None):
     cfg = load_config(config, [*(overrides or []), 'input.target_fps=0', 'input.coords=camera'])
     bm = body_model if isinstance(body_model, BodyModel) else BodyModel.from_npz(body_model)
     motion = load_motion(source, cfg.input, bm)
-    quats, _ = stabilize_pose(motion.quats, motion.fps, cfg.jitter)
+    rest_joints = bm.rest_joints(motion.betas)
+    quats, _ = stabilize_pose(motion.quats, motion.fps, cfg.jitter, rest_joints)
     root = stabilize_root(motion.root_pos, cfg.jitter.root_median_window)
-    _, joints = forward_kinematics(quats, root, bm.rest_joints(motion.betas), bm.parents)
+    _, joints = forward_kinematics(quats, root, rest_joints, bm.parents)
     return joints @ CAMERA_TO_YUP.T * 1000.0   # Y 上向き → カメラ座標（X 軸まわりの 180 度は自分自身の逆）
 
 
