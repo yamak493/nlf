@@ -20,6 +20,7 @@ from .floor import estimate_floor
 from .filters import runs
 from .foot_ik import boundary_steps, build_foot_ik
 from .ground import floating_frames, ground_offset
+from .hand_reach import keep_hand_positions
 from .jitter import stabilize_pose, stabilize_root
 from .lean import estimate_lean
 from .motion_io import load_motion
@@ -62,6 +63,7 @@ class ConversionResult:
     depth: object = None
     ground: object = None
     lean: object = None
+    hand_reach: object = None    # ステージ9h（胴に対する手の位置）の結果
     arm_collision: object = None   # ステージ9a（腕どうしの貫通の防止）の結果
     wrist: object = None         # ステージ2b（手首の向きの補正）の結果
     contacts: object = None      # ステージ9b（腕・手のひら・指先と体・相手の腕の接触）の結果
@@ -172,6 +174,23 @@ def log_contacts(contacts, unit, log, label='[9b]'):
         f'{info["overlap_frames"]["before"]} → {info["overlap_frames"]["after"]} フレーム'
         + (f'（{parts}）' if parts else '')
         + f' / 補正 最大 肩 {corr["shoulder"]:.1f}・ひじ {corr["elbow"]:.1f}・手首 {corr["wrist"]:.1f} 度')
+
+
+def log_hand_reach(reach, log):
+    if log is None:
+        return
+    if not reach.enabled:
+        log('[9h] 胴に対する手の位置: 扱いません')
+        return
+    info = reach.info
+    ratio = info['ratio']
+    lr = '左 {}・右 {}'.format
+    log(f'[9h] 胴に対する手の位置: 胴の比（MMD / SMPL）肩幅 {ratio["width"]:.2f}・高さ {ratio["height"]:.2f}・'
+        f'厚み {ratio["depth"]:.2f}（厚み: SMPL {info["smpl"]["depth_source"]} / MMD {info["mmd"]["depth_source"]}）'
+        f' / 位置を保ったフレーム ' + lr(*info['frames'])
+        + ' / 手首の移動 最大 ' + lr(*(f'{v:.1f}' for v in info['max_shift_cm'])) + ' cm'
+        + f' / 補正 最大 肩 {info["max_correction_deg"]["shoulder"]:.1f}・'
+        f'ひじ {info["max_correction_deg"]["elbow"]:.1f} 度')
 
 
 def log_twist(twist, log):
@@ -420,6 +439,12 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     # ---- 9. 上半身の回転リターゲット ----
     local = rt.local_quats(kin.glob_rot)
 
+    # ---- 9h. 胴に対する手の位置（胴の近くの手首を、胴の寸法の比で移した位置へ 2 ボーン IK で置く） ----
+    local, reach = keep_hand_positions(skel, rt, kin.glob_rot, local, rest.joints,
+                                       bm.rest_vertices(motion.betas), bm.weights, cfg.hand_reach,
+                                       cfg.contacts, k)
+    log_hand_reach(reach, log)
+
     # ---- 9a. 腕どうしの貫通の防止 ----
     local, arms = resolve_arm_collisions(skel, rt, kin.glob_rot, local, cfg.arm_collision, k, fps)
     n_before, n_after = arms.overlap_frames(OVERLAP_TOL_M * k)
@@ -457,8 +482,8 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     result = ConversionResult(
         str(out_path or ''), n_keys, cfg, fps, k, motion, quats, kin, kin_raw, floor, contact,
         ik, center, ankle_rest, geom, rt.global_matrix('下半身', kin_raw.glob_rot), local, tracks,
-        warnings=warns, depth=depth, ground=ground, lean=lean, arm_collision=arms, skeleton=skel,
-        retargeter=rt, wrist=wrist, contacts=contacts, local_before_contacts=local_before_contacts,
+        warnings=warns, depth=depth, ground=ground, lean=lean, hand_reach=reach, arm_collision=arms,
+        skeleton=skel, retargeter=rt, wrist=wrist, contacts=contacts, local_before_contacts=local_before_contacts,
         twist=twist, smpl_rest=rest.joints, wrist_limits=limits)
     result.info = dict(
         frames=motion.num_frames, fps=fps, source_fps=motion.source_fps, scale=k,
@@ -466,6 +491,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         skeleton=skel.source, model_name=model_name, bones=[t.name for t in tracks],
         fk_check_mm=motion.fk_check_mm, jitter=jitter_info,
         wrist=None if wrist is None else wrist.info,
+        hand_reach=reach.info,
         contacts=contacts.info,
         wrist_limits=dict(limits.info, before_contacts={
             k: limits_pre.info[k] for k in ('out_of_range_frames', 'changed_frames', 'max_correction_deg')}),

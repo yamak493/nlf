@@ -323,6 +323,39 @@ def save_plots(r, out_dir):
         paths['lean'] = out_dir / 'lean.png'
         fig.savefig(paths['lean'], dpi=110)
 
+    # 2h. 胴に対する手の位置（位置を保った割合・手首の移動・肩とひじの補正角）
+    if getattr(r, 'hand_reach', None) is not None and r.hand_reach.enabled:
+        h = r.hand_reach
+        ratio = h.info['ratio']
+        fig = Figure(figsize=(12, 5))
+        axes = fig.subplots(2, 1, sharex=True)
+        for side, ax in enumerate(axes):
+            name = ('left', 'right')[side]
+            ax.plot(frames, h.shift[:, side] * cm, color='tab:blue', lw=1.2,
+                    label='wrist shift to the torso-relative target [cm]')
+            ax.plot(frames, h.residual[:, side] * cm, color='tab:red', lw=1, ls='--',
+                    label='left over by max_deg [cm]')
+            ax.plot(frames, h.correction_deg[:, side, 0], color='tab:purple', lw=1,
+                    label='shoulder correction [deg]')
+            ax.plot(frames, h.correction_deg[:, side, 1], color='tab:orange', lw=1,
+                    label='elbow correction [deg]')
+            ax.set_ylabel('[cm] / [deg]')
+            ax.set_ylim(bottom=0.0)
+            ax2 = ax.twinx()
+            ax2.fill_between(frames, 0.0, h.weight[:, side], color='tab:green', alpha=0.15, lw=0,
+                             label='weight (1 = keep the position relative to the torso)')
+            ax2.set_ylim(0.0, 1.05)
+            ax2.set_ylabel('weight')
+            ax.set_title(f'{name} hand relative to the torso: {h.info["frames"][side]} frames; torso ratio '
+                         f'MMD / SMPL width {ratio["width"]:.2f}, height {ratio["height"]:.2f}, '
+                         f'depth {ratio["depth"]:.2f}', fontsize=10)
+            lines = ax.get_lines()[:4] + ax2.collections[:1]
+            ax.legend(lines, [ln.get_label() for ln in lines], loc='upper right', fontsize=7)
+        axes[-1].set_xlabel('frame')
+        fig.tight_layout()
+        paths['hand_reach'] = out_dir / 'hand_reach.png'
+        fig.savefig(paths['hand_reach'], dpi=110)
+
     # 2e. 腕どうしの貫通の防止（左右の腕のカプセルの重なりと、自重する腕に掛けた補正角）
     if r.arm_collision is not None:
         a = r.arm_collision
