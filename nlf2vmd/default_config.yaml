@@ -171,7 +171,7 @@ diagnostics:
   enabled: true
   plots: true
 
-# ---- 口パク（リップシンク）: ノートブックのセル 15a / python -m nlf2vmd.lipsync ----
+# ---- 口パク（リップシンク）: ノートブックのセル 11a / python -m nlf2vmd.lipsync ----
 # Allosaurus で認識した音素を口の形（あ・い・う・え・お・ん）に分け、声が出ている間だけ口を動かす。
 # 音量は Demucs で取り出したボーカルのもの。dB のしきい値は「大きな声の音量（基準）」からの差で書く。
 lipsync:
@@ -207,7 +207,7 @@ lipsync:
   smooth_sec: 0.03          # 形の切り替え・開き具合の変化をならすガウシアンの σ [秒]
   thin_tolerance: 0.01      # キーの間引き: 線形補間との差がこれ以内なら省く（0 で全フレームにキー）
 
-# ---- 手の形（指）: ノートブックのセル 16a / python -m nlf2vmd.hands ----
+# ---- 手の形（指）: ノートブックのセル 12a / python -m nlf2vmd.hands ----
 # MediaPipe Hands の手のランドマーク（21 点）から指ごとの曲げを測り、手の形（下の presets の 9 種）に分けて、
 # 形ごとに決めた指の角度を指ボーンのキーにする。キーは形が変わる所だけに打つ。
 hands:

@@ -93,7 +93,7 @@ def resolve_body_model(body_model, source):
         return BodyModel.from_smplfitter()
     except Exception as e:
         raise RuntimeError(
-            'SMPL の体モデルが見つかりません。ノートブックのセル 14 で書き出した '
+            'SMPL の体モデルが見つかりません。ノートブックのセル 10 で書き出した '
             f'{BODY_MODEL_FILENAME} を --body-model で指定してください。') from e
 
 
