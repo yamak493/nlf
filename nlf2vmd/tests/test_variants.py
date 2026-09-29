@@ -1,4 +1,4 @@
-"""出力する VMD の種類（フル / フル [移動なし] / 上半身のみ / 表情のみ）。"""
+"""出力する VMD の種類（フル / フル [接地優先] / フル [移動なし] / 上半身のみ / 表情のみ）。"""
 import numpy as np
 import pytest
 
@@ -162,15 +162,24 @@ def test_write_variants_with_lipsync(tmp_path, walk):
     assert lip.tracks and list(tmp_path.glob('*.vmd')) == []
 
     counts = {}
-    for kind in ('full', 'no_move', 'upper_body', 'face'):
+    for kind in ('full', 'locked', 'no_move', 'upper_body', 'face'):
         morphs = lip.tracks if kind != 'upper_body' else ()
         write_variant(walk, kind, tmp_path / f'{kind}.vmd', morphs=morphs, log=None)
         v = read_vmd(tmp_path / f'{kind}.vmd')
         counts[kind] = (len(v.bone_names()), len(v.morph_names()))
         assert v.model_name == walk.info['model_name']
     n_bones = len(walk.tracks)
-    assert counts == dict(full=(n_bones, 6), no_move=(n_bones, 6),
+    assert counts == dict(full=(n_bones, 6), locked=(n_bones, 6), no_move=(n_bones, 6),
                           upper_body=(n_bones - 5, 0), face=(0, 6))
+
+
+def test_cli_writes_full_and_locked_by_default(tmp_path):
+    out = tmp_path / 'motion_full.vmd'
+    assert cli_main(['--demo', '-o', str(out), '--no-plots']) == 0
+    assert sorted(p.name for p in tmp_path.glob('*.vmd')) == ['motion_full.vmd',
+                                                             'motion_full_locked.vmd']
+    assert len(read_vmd(tmp_path / 'motion_full_locked.vmd').bone_names()) == len(
+        read_vmd(out).bone_names())
 
 
 def test_cli_writes_selected_variants(tmp_path):

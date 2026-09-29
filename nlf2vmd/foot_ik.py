@@ -28,14 +28,27 @@ def _blend_weights(n):
     return 1.0 - filters.smoothstep(i / (n + 1.0))
 
 
-def build_foot_ik(ankle_pos, ankle_rest, rot_quats, contact, fps, unit, cfg):
+def _lock_pieces(anchor, s, e):
+    """接地区間 s〜e の中で、ロックの値を求める部分区間 [(開始, 終了)]（anchor の連続区間。無ければ区間全体）。"""
+    if anchor is None or not anchor[s:e + 1].any():
+        return [(s, e)]
+    return [(s + a, s + b) for a, b in filters.runs(anchor[s:e + 1])]
+
+
+def build_foot_ik(ankle_pos, ankle_rest, rot_quats, contact, fps, unit, cfg, swing=None,
+                  anchor=None):
     """ankle_pos: (T, 2, 3) 足首の位置 / ankle_rest: (2, 3) 直立時の足首位置（どちらも同じ空間）。
     rot_quats: (T, 2, 4) 足ＩＫの回転（足首の大域回転 × 補正回転）。unit: スケール係数。
+    swing: (T, 2, 3) 遊脚の軌道。与えると平滑化をせずにこれを使う（フル [接地優先] で、フルの軌道を使うため）
+    anchor: (T, 2) bool ロックの値を求めるフレーム。接地区間の中に anchor のフレームがあれば、その連続区間ごとに
+    ロックの値（位置・回転）を求め、区間の残りのフレームは、前・後の値を保つか、前後 2 つの値の間をなめらかに
+    つなぐ（フル [接地優先] で、フルの接地区間を広げても、フルの接地区間の値は変えないため）
     """
     raw = np.asarray(ankle_pos, np.float64)
     T = len(raw)
     oe = cfg.swing_one_euro
     target = np.empty_like(raw)
+    swing_in = swing
     swing = np.empty_like(raw)
     rot = np.array(rot_quats, np.float64, copy=True)
     weights = _blend_weights(int(cfg.blend_frames))
@@ -44,8 +57,11 @@ def build_foot_ik(ankle_pos, ankle_rest, rot_quats, contact, fps, unit, cfg):
         segs = contact.segments[foot]
         flags = contact.flags[:, foot]
         # 遊脚の平滑化（速い動きは残し、遅い震えを消す）。フィルタは m 単位で掛ける
-        sw = filters.one_euro(raw[:, foot] / unit, fps, oe.min_cutoff, oe.beta, oe.d_cutoff,
-                              oe.zero_phase) * unit
+        if swing_in is None:
+            sw = filters.one_euro(raw[:, foot] / unit, fps, oe.min_cutoff, oe.beta, oe.d_cutoff,
+                                  oe.zero_phase) * unit
+        else:
+            sw = np.array(swing_in[:, foot], np.float64, copy=True)
         swing[:, foot] = sw
         out = sw.copy()
         q = quat.make_continuous(rot[:, foot])
@@ -55,20 +71,36 @@ def build_foot_ik(ankle_pos, ankle_rest, rot_quats, contact, fps, unit, cfg):
         # snap_to_floor なら、上下は「足首の高さ − その足の最下点の高さ」（足裏を床に着けたときの足首の高さ）
         # の中央値にする（推定のずれで接地中の足が床から浮いていても、足裏が床に着く）
         sole = np.asarray(contact.heights)[:, foot].min(-1)
+        pinned = None if anchor is None else np.asarray(anchor, bool)[:, foot]
         for s, e in segs:
-            lock = np.median(raw[s:e + 1, foot], axis=0)
-            if cfg.snap_to_floor:
-                lock[1] = np.median(raw[s:e + 1, foot, 1] - sole[s:e + 1])
-            out[s:e + 1] = lock
-            foot_locks.append((s, e, lock))
+            pieces = []
+            for a, b in _lock_pieces(pinned, s, e):
+                lock = np.median(raw[a:b + 1, foot], axis=0)
+                if cfg.snap_to_floor:
+                    lock[1] = np.median(raw[a:b + 1, foot, 1] - sole[a:b + 1])
+                q_lock = quat.average(q[a:b + 1]) if cfg.lock_rotation else None
+                pieces.append((a, b, lock, q_lock))
+                foot_locks.append((a, b, lock))
+            # 部分区間の外（anchor の無いフレーム）は、区間の端では最寄りの値を保ち、部分区間の間はなめらかにつなぐ
+            (a0, _, lock0, q0), (_, b1, lock1, q1) = pieces[0], pieces[-1]
+            out[s:a0], out[b1 + 1:e + 1] = lock0, lock1
+            for a, b, lock, _ in pieces:
+                out[a:b + 1] = lock
+            for (_, b, lock, qa), (a, _, nxt, qb) in zip(pieces[:-1], pieces[1:]):
+                w = filters.smoothstep(np.arange(1, a - b) / (a - b))
+                out[b + 1:a] = lock + (nxt - lock) * w[:, None]
+                if cfg.lock_rotation:
+                    q_out[b + 1:a] = quat.slerp(qa, qb, w)
             if cfg.lock_rotation:
-                q_out[s:e + 1] = quat.average(q[s:e + 1])
+                q_out[s:a0], q_out[b1 + 1:e + 1] = q0, q1
+                for a, b, _, q_lock in pieces:
+                    q_out[a:b + 1] = q_lock
         # 境界のブレンド: 「ロック値 − 遊脚値」を遊脚側だけで減衰させて足す
         offset = np.zeros((T, 3))
         rot_delta = []
-        for s, e, lock in foot_locks:
+        for s, e in segs:
             for edge, step in ((e, 1), (s, -1)):
-                d = lock - sw[edge]
+                d = out[edge] - sw[edge]
                 dq = quat.mul(q_out[edge], quat.conj(q[edge]))
                 for i, w in enumerate(weights, start=1):
                     f = edge + step * i
