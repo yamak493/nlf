@@ -72,16 +72,19 @@ def foot_motion_near_floor(pos, heights, limit, unit):
     return (d[:, [0, 2]].mean(0) / unit * 100.0).tolist()
 
 
-def output_sole_heights(r):
+def output_sole_heights(r, foot_ik=None, contact=None):
     """(T, 2) 出力の足ＩＫでの足裏の高さ（足首の高さ − その姿勢での足首から足裏の最下点までの高さ）。
 
     接地区間は、足ＩＫの回転を区間内の平均で固定しているので、足首から足裏までの高さも区間内の中央値を使う。
+    foot_ik / contact を渡すと、r の代わりにその足ＩＫ・接地区間で求める（フル [接地優先] の出力を調べる）。
     """
+    foot_ik = r.foot_ik if foot_ik is None else foot_ik
+    contact = r.contact if contact is None else contact
     ankle_above_sole = r.kin.joints[:, ANKLES, 1] - r.kin.contact_points[..., 1].min(-1)
-    sole = r.foot_ik.target[..., 1] - ankle_above_sole
+    sole = foot_ik.target[..., 1] - ankle_above_sole
     for foot in range(2):
-        for s, e in r.contact.segments[foot]:
-            sole[s:e + 1, foot] = r.foot_ik.target[s, foot, 1] - np.median(
+        for s, e in contact.segments[foot]:
+            sole[s:e + 1, foot] = foot_ik.target[s:e + 1, foot, 1] - np.median(
                 ankle_above_sole[s:e + 1, foot])
     return sole
 

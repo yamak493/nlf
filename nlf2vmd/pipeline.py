@@ -75,6 +75,7 @@ class ConversionResult:
     smpl_rest: np.ndarray = None  # SMPL の初期姿勢の関節（体型を固定したもの）
     skeleton: object = None      # 対象モデルの骨格（variants.py で種類別のキーを作り直すのに使う）
     retargeter: object = None
+    pelvis_rest: np.ndarray = None   # (3,) 直立したときの骨盤の位置（センターの差分の基準。variants.py でセンターを求め直すのに使う）
 
 
 def resolve_skeleton(pmx):
@@ -522,7 +523,8 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         ik, center, ankle_rest, geom, rt.global_matrix('下半身', kin_raw.glob_rot), local, tracks,
         warnings=warns, depth=depth, ground=ground, lean=lean, hand_reach=reach, arm_collision=arms,
         skeleton=skel, retargeter=rt, wrist=wrist, contacts=contacts, local_before_contacts=local_before_contacts,
-        twist=twist, smpl_rest=rest.joints, wrist_limits=limits, outliers=outliers)
+        twist=twist, smpl_rest=rest.joints, wrist_limits=limits, outliers=outliers,
+        pelvis_rest=pelvis_rest)
     result.info = dict(
         frames=motion.num_frames, fps=fps, source_fps=motion.source_fps, scale=k,
         smpl_leg_length_m=smpl_leg, mmd_leg_length=skel.mean_leg_length(),

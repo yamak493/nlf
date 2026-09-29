@@ -1,10 +1,15 @@
-"""出力する VMD の種類: フル / フル [移動なし] / 上半身のみ / 表情のみ。
+"""出力する VMD の種類: フル / フル [接地優先] / フル [移動なし] / 上半身のみ / 表情のみ。
 
 convert（pipeline.py）の結果から、種類ごとにボーンのキー列を作って書き出す。口パク（lipsync.py の
 MorphTrack）と手の形（hands.py の指ボーンの BoneTrack）はどの種類にも足せる（ノートブックでは、口パクは
-フル・フル [移動なし]・表情のみ に、手の形は フル・フル [移動なし]・上半身のみ に入れる）。
+フル・フル [接地優先]・フル [移動なし]・表情のみ に、手の形は フル・フル [接地優先]・フル [移動なし]・上半身のみ
+に入れる）。
 
   full        センター・グルーブ・足ＩＫ・全身の回転（convert の結果そのまま）
+  locked      フルから、ジャンプ・片足上げなどで両足が床から離れた所を除く（locked.py）。ジャンプとして残した区間は
+              体を床へ下ろしてセンターを求め直し、どのフレームでも低いほうの足を床に着け、床に下ろした足は
+              フルで着いていた位置に固定する。回転とセンターの水平移動はフルと同じで、浮いていた所から
+              離れたフレームはフルと同じ値になる（フルと切り貼りして使う）
   no_move     フルから体の水平移動（センターの X・Z）を除く。足ＩＫは、接地している間はその場に固定し
               （足が滑らない）、足跡を「その足が着いている間のセンターの平均位置」の分だけずらす。
               足が浮いている間は、足が次の足跡へ進んだ割合だけずらし量も進める（その場で足踏みする）。
@@ -22,11 +27,13 @@ import numpy as np
 
 from . import filters, quat
 from .center import apply_reach_clamp
+from .locked import HOVER_M, SAME_POS_M, SAME_ROT_DEG, format_ranges, locked_motion
 from .pipeline import build_tracks
 from .vmd import write_vmd
 
-VARIANTS = ('full', 'no_move', 'upper_body', 'face')
-LABELS = dict(full='フル', no_move='フル [移動なし]', upper_body='上半身のみ', face='表情のみ')
+VARIANTS = ('full', 'locked', 'no_move', 'upper_body', 'face')
+LABELS = dict(full='フル', locked='フル [接地優先]', no_move='フル [移動なし]', upper_body='上半身のみ',
+              face='表情のみ')
 LOWER_BODY_BONES = ('下半身',)
 STRIDE_M = 0.1   # 移動なし: 足跡がこれ以上 [m] 動いた歩は、足が進んだ割合だけで足跡をずらす
 STILL_M = 0.03   # 移動なし: 足ＩＫがロック位置からこれ以内 [m] なら、足が着いたままとみなす
@@ -157,6 +164,24 @@ def no_move_motion(result):
     return center_delta, ik, info
 
 
+def log_locked(info, fps, log):
+    hover = info['hover_frames']
+    added = info['added_lock_frames']
+    jump = (f'ジャンプとして残した {info["jump_frames"]} フレームの体を床へ下ろした量 最大 '
+            f'{info["max_jump_cm"]:.1f} cm' if info['jump_frames'] else 'ジャンプとして残した区間なし')
+    log(f'[接地優先] {jump} / 足ＩＫを下ろした量 最大 {info["max_foot_drop_cm"]:.1f} cm / '
+        f'床に固定した足のフレームを追加 左 {added[0]}・右 {added[1]} / 両足とも {HOVER_M * 100:.0f}cm より'
+        f'浮いたフレーム {hover["before"]} → {hover["after"]}')
+    if info['differ_frames']:
+        log('[接地優先] フルと違うフレーム: ' + format_ranges(info['differ_frames'], fps))
+    else:
+        log(f'[接地優先] フルと同じ動きです（どのフレームもフルとの差が {SAME_POS_M * 1000:.0f}mm・'
+            f'{SAME_ROT_DEG:g} 度以下）')
+    if info['exceed_after']:
+        log(f'⚠️ [接地優先] {info["exceed_after"]} フレームで脚が伸び切っています'
+            '（center.reach_max_drop_m を大きくすると下げられます）')
+
+
 def variant_tracks(result, kind, log=print):
     """種類 kind（VARIANTS）のボーンのキー列（BoneTrack のリスト）。"""
     log = log or (lambda *a: None)
@@ -171,6 +196,11 @@ def variant_tracks(result, kind, log=print):
     args = (result.contact, result.config, result.scale)
     if kind == 'upper_body':
         return build_tracks(result.skeleton, None, None, upper_body_quats(result), *args)
+    if kind == 'locked':
+        lm = locked_motion(result)
+        log_locked(lm.info, result.fps, log)
+        return build_tracks(result.skeleton, lm.center.delta, lm.foot_ik, result.local_quats,
+                            lm.contact, result.config, result.scale)
     center_delta, ik, info = no_move_motion(result)
     log(f'[移動なし] 取り除いた水平移動 最大 {info["removed_travel_cm"]:.1f} cm / '
         f'届く高さへ下げた量 最大 {info["max_drop_cm"]:.1f} cm')
