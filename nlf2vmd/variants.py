@@ -5,7 +5,8 @@ MorphTrack）と手の形（hands.py の指ボーンの BoneTrack）はどの種
 フル・フル [接地優先]・フル [移動なし]・表情のみ に、手の形は フル・フル [接地優先]・フル [移動なし]・上半身のみ
 に入れる）。
 
-  full        センター・グルーブ・足ＩＫ・全身の回転（convert の結果そのまま）
+  full        センター・グルーブ・足ＩＫ・全身の回転（convert の結果そのまま）。脚（足・ひざ・足首）の回転は、どの種類でも
+              その種類のセンター・足ＩＫに届くように解き直す（ステージ9l。pipeline.build_tracks）
   locked      フルから、ジャンプ・片足上げなどで両足が床から離れた所を除く（locked.py）。ジャンプとして残した区間は
               体を床へ下ろしてセンターを求め直し、どのフレームでも両足（locked.both_feet: false なら低いほうの
               足）を床に着け、床に下ろした足はフルで着いていた位置に固定する。回転とセンターの水平移動はフルと同じで、浮いていた所から
@@ -16,8 +17,8 @@ MorphTrack）と手の形（hands.py の指ボーンの BoneTrack）はどの種
               上下（グルーブ）は、ひざの曲げ・しゃがみ・ジャンプでの骨盤の高さなので残し、脚が届く高さへの
               クランプだけ掛け直す（上下も除くと、脚が床に届かず足が浮くため）
   upper_body  上半身から先（上半身・上半身2・首・頭・肩・腕・ひじ・手首）の回転だけ。センター・下半身・
-              足ＩＫにはキーを打たない。体全体の向き（下半身の鉛直軸まわりの回転）を除くので、振り向いても
-              上半身だけが回ることはなく、下半身に対するひねり・おじぎ・体の傾きは残る
+              脚（足・ひざ・足首）・足ＩＫにはキーを打たない。体全体の向き（下半身の鉛直軸まわりの回転）を除くので、
+              振り向いても上半身だけが回ることはなく、下半身に対するひねり・おじぎ・体の傾きは残る
   face        ボーンのキーは無し（口パクのモーフのキーだけ）
 """
 from dataclasses import replace
@@ -194,20 +195,21 @@ def variant_tracks(result, kind, log=print):
     if result.retargeter is None or result.skeleton is None:
         raise ValueError('convert の結果に骨格の情報がありません（この版の convert で変換し直してください）')
     args = (result.contact, result.config, result.scale)
+    poles = getattr(result, 'knee_poles', None)
     if kind == 'upper_body':
         return build_tracks(result.skeleton, None, None, upper_body_quats(result), *args)
     if kind == 'locked':
         lm = locked_motion(result)
         log_locked(lm.info, result.fps, log)
         return build_tracks(result.skeleton, lm.center.delta, lm.foot_ik, result.local_quats,
-                            lm.contact, result.config, result.scale)
+                            lm.contact, result.config, result.scale, poles=poles)
     center_delta, ik, info = no_move_motion(result)
     log(f'[移動なし] 取り除いた水平移動 最大 {info["removed_travel_cm"]:.1f} cm / '
         f'届く高さへ下げた量 最大 {info["max_drop_cm"]:.1f} cm')
     if info['exceed_after']:
         log(f'⚠️ [移動なし] {info["exceed_after"]} フレームで脚が伸び切っています'
             '（足跡の位置が骨盤から遠い所。center.reach_max_drop_m を大きくすると下げられます）')
-    return build_tracks(result.skeleton, center_delta, ik, result.local_quats, *args)
+    return build_tracks(result.skeleton, center_delta, ik, result.local_quats, *args, poles=poles)
 
 
 def write_variant(result, kind, path, morphs=(), bones=(), log=print):

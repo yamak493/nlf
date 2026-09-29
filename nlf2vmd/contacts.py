@@ -11,7 +11,8 @@
 * **体の当たり判定**: PMX の剛体（モデルの作者が置いた当たり判定。ボーン追従の剛体と、スカート・胸などの物理の剛体）。
   剛体が無ければメッシュの頂点をボーンごとに箱で包んだもの、それも無ければ標準の体格の形。どれもカプセルにする
   （箱は、薄い向きの厚みを半径にしたカプセル 2 本）。腕・肩の剛体と、髪・脚の物理の剛体は使わない。
-  脚の位置は MMD では足ＩＫで決まる（キーを打つ回転が無い）ので、SMPL の股関節・膝の向きから求める
+  脚の位置は、ステージ9l で解いた脚の回転（MMD で表示される脚）から求める（脚のキーを打たないときは、SMPL の股関節・
+  膝の向きから近似する）
 * **組**: 腕の各カプセル × 体の各カプセル（両腕とも）、自重する腕の各カプセル × 相手の腕の各カプセル
   （arm_collision.mode。none なら腕どうしは見ない）。同じ腕の中（指と手のひら等）は見ない。
   初期姿勢（A ポーズ）ですでに重なっている組（脇の下の上腕と胸など）は扱わず、上腕の肩側 upper_arm_skip の
@@ -284,8 +285,8 @@ def body_capsules(skel, cfg, unit):
 
 # ---- FK ----
 def leg_globals(skel, glob_rot, smpl_rest):
-    """MMD の脚（足・ひざ）の大域回転 {名前: (T, 3, 3)}。MMD の脚は足ＩＫで決まり回転のキーが無いので、SMPL の
-    股関節・膝の大域回転に、初期姿勢の骨の向きを合わせる最小回転を掛けたもので近似する。"""
+    """MMD の脚（足・ひざ）の大域回転 {名前: (T, 3, 3)}。脚のキーを打たない（ステージ9l を使わない）ときの近似で、
+    SMPL の股関節・膝の大域回転に、初期姿勢の骨の向きを合わせる最小回転を掛けたもの。"""
     J = np.asarray(smpl_rest, np.float64)
     out = {}
     for side, s in enumerate(SIDES):
@@ -617,11 +618,13 @@ def _is_identity(states):
 
 
 def resolve_contacts(skel, rt, glob_rot, local, cfg, arm_cfg, finger_bones, yield_mode, unit, fps,
-                     smpl_rest, finger_local=None, log=None):
+                     smpl_rest, finger_local=None, log=None, leg_glob=None):
     """ステージ9b。local（ステージ9a の後のローカル回転）の 腕・ひじ・手首 を直した dict と ContactResult を返す。
 
     glob_rot: SMPL の大域回転 (T, J, 3, 3) / finger_local: 指ボーンのローカル回転 {名前: (T, 4)}（内部座標。
     None なら初期姿勢の指）/ yield_mode: arm_collision.mode（腕どうしで自重する腕）/ smpl_rest: SMPL の初期姿勢の関節
+    leg_glob: 脚（足・ひざ・足首）の大域回転 {名前: (T, 3, 3)}（ステージ9l で解いた、MMD で表示される脚）。None なら
+    SMPL の股関節・膝の向きから近似する（leg_globals）
     """
     T = len(glob_rot)
     caps = [arm_capsules(skel, s, cfg, arm_cfg, finger_bones, unit) for s in range(2)]
@@ -664,7 +667,8 @@ def resolve_contacts(skel, rt, glob_rot, local, cfg, arm_cfg, finger_bones, yiel
 
     # ---- FK（指・脚も含めた大域回転） ----
     glob = globals_from_local(rt, glob_rot, local)
-    glob.update({k: v for k, v in leg_globals(skel, glob_rot, smpl_rest).items() if k not in glob})
+    legs = leg_globals(skel, glob_rot, smpl_rest) if leg_glob is None else leg_glob
+    glob.update({k: v for k, v in legs.items() if k not in glob})
     def depth(name):
         n, d = name, 0
         while skel.parents.get(n) is not None and d < 100:

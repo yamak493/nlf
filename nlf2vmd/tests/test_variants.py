@@ -4,6 +4,7 @@ import pytest
 
 from nlf2vmd import convert, load_config, quat
 from nlf2vmd.__main__ import main as cli_main
+from nlf2vmd.legs import LEG_BONES
 from nlf2vmd.lipsync import make_lipsync, save_analysis
 from nlf2vmd.synthetic import synthetic_walk
 from nlf2vmd.variants import (LOWER_BODY_BONES, footprint_shift, footprints, heading_matrices,
@@ -72,7 +73,8 @@ def test_no_move_keeps_the_body_in_place_without_sliding(walk):
     assert np.abs(full['センター'].positions[:, 2]).max() > 50.0
     np.testing.assert_array_equal(tracks['センター'].positions, 0.0)
     for name, t in full.items():
-        if 'ＩＫ' not in name and name not in ('センター', 'グルーブ'):
+        # 脚の回転は、この種類のセンター・足ＩＫで解き直す
+        if 'ＩＫ' not in name and name not in ('センター', 'グルーブ') + LEG_BONES:
             np.testing.assert_array_equal(tracks[name].rotations, t.rotations)
 
     center, ik, info = no_move_motion(walk)
@@ -169,8 +171,9 @@ def test_write_variants_with_lipsync(tmp_path, walk):
         counts[kind] = (len(v.bone_names()), len(v.morph_names()))
         assert v.model_name == walk.info['model_name']
     n_bones = len(walk.tracks)
+    # 上半身のみ: センター・グルーブ・下半身・足ＩＫ（2）・脚の回転（足・ひざ・足首 × 2）を除く
     assert counts == dict(full=(n_bones, 6), locked=(n_bones, 6), no_move=(n_bones, 6),
-                          upper_body=(n_bones - 5, 0), face=(0, 6))
+                          upper_body=(n_bones - 5 - len(LEG_BONES), 0), face=(0, 6))
 
 
 def test_cli_writes_full_and_locked_by_default(tmp_path):

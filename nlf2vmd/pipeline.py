@@ -23,6 +23,7 @@ from .ground import floating_frames, ground_offset
 from .hand_reach import keep_hand_positions
 from .jitter import stabilize_pose, stabilize_root
 from .lean import estimate_lean
+from .legs import knee_poles, solve_legs
 from .motion_io import load_motion
 from .outliers import PART_LABELS, remove_outliers
 from .pmx import PmxModel, read_pmx
@@ -76,6 +77,8 @@ class ConversionResult:
     skeleton: object = None      # 対象モデルの骨格（variants.py で種類別のキーを作り直すのに使う）
     retargeter: object = None
     pelvis_rest: np.ndarray = None   # (3,) 直立したときの骨盤の位置（センターの差分の基準。variants.py でセンターを求め直すのに使う）
+    knee_poles: np.ndarray = None    # (T, 2, 3) SMPL の膝の向き（ステージ9l。種類ごとに脚の回転を解き直すのに使う）
+    legs: object = None              # ステージ9l（脚の回転）の結果（フル）。脚のキーを打たないときは None
 
 
 def resolve_skeleton(pmx):
@@ -123,13 +126,18 @@ def apply_scale(kin, k, depth_scale):
     return kin
 
 
-def build_tracks(skel, center_delta, ik, local, contact, cfg, unit):
+def build_tracks(skel, center_delta, ik, local, contact, cfg, unit, poles=None):
     """VMD のキー列を作る（捩りボーンへひねりを分け、MMD 座標へ変換し、必要なら間引く）。
 
     local: ボーン名 → ローカル回転（捩りボーンに分ける前。ここで cfg.twist に従って分ける）
     center_delta / ik が None なら、センター・グルーブ / 足ＩＫのキーは打たない。
+    poles: SMPL の膝の向き（legs.knee_poles）。渡すと、このセンター・足ＩＫで脚（足・ひざ・足首）の回転を解いて
+    キーを打つ（ステージ9l。cfg.leg_keys.enabled のとき）。
     """
     cfg_vmd = cfg.vmd
+    legs = leg_rotations(skel, center_delta, ik, local, poles, cfg)
+    if legs is not None:
+        local = dict(local, **legs.local)
     local = split_twist(skel, local, cfg.twist).local
     T = len(contact.flags)
     frames = np.arange(T)
@@ -158,6 +166,26 @@ def build_tracks(skel, center_delta, ik, local, contact, cfg, unit):
                               forced)
         tracks.append(BoneTrack(name, frames[keep], p[keep], q[keep]))
     return tracks
+
+
+def leg_rotations(skel, center_delta, ik, local, poles, cfg):
+    """ステージ9l の LegResult（脚のキーを打たないときは None）。"""
+    if poles is None or center_delta is None or ik is None or not cfg.leg_keys.enabled:
+        return None
+    return solve_legs(skel, center_delta, ik, local, poles, cfg.leg_keys)
+
+
+def log_legs(legs, log):
+    if log is None:
+        return
+    if legs is None:
+        log('[9l] 脚の回転（膝の向き）: キーを打ちません（足ＩＫだけ）')
+        return
+    info = legs.info
+    med = info['knee_out_deg']['median']
+    log(f'[9l] 脚の回転（膝の向き）: {"・".join(info["bones"])} にキー / 膝の向き（骨盤の正面から外向き +）'
+        f'中央値 左 {med[0]:+.0f}・右 {med[1]:+.0f} 度 / 足ＩＫに届かないフレーム '
+        f'左 {info["unreached_frames"][0]}・右 {info["unreached_frames"][1]}')
 
 
 def log_outliers(outliers, fps, log, warn):
@@ -257,7 +285,8 @@ def apply_hand_poses(result, hand_tracks, log=print):
     local, contacts = resolve_contacts(
         result.skeleton, result.retargeter, result.kin.glob_rot, result.local_before_contacts,
         cfg.contacts, cfg.arm_collision, cfg.hands.bones, cfg.arm_collision.mode, result.scale,
-        result.fps, result.smpl_rest, finger_local=finger_local)
+        result.fps, result.smpl_rest, finger_local=finger_local,
+        leg_glob=None if result.legs is None else result.legs.glob)
     local, limits = limit_wrists(result.skeleton, local, cfg.wrist_limits, result.fps)
     result.local_quats = local
     result.wrist_limits = limits
@@ -265,7 +294,7 @@ def apply_hand_poses(result, hand_tracks, log=print):
     result.contacts = contacts
     result.twist = split_twist(result.skeleton, local, cfg.twist)
     result.tracks = build_tracks(result.skeleton, result.center.delta, result.foot_ik, local,
-                                 result.contact, cfg, result.scale)
+                                 result.contact, cfg, result.scale, poles=result.knee_poles)
     result.info['contacts'] = contacts.info
     result.info['twist'] = result.twist.info
     log_contacts(contacts, result.scale, log, label='[9b 指の形を入れて]')
@@ -478,6 +507,12 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     # ---- 9. 上半身の回転リターゲット ----
     local = rt.local_quats(kin.glob_rot)
 
+    # ---- 9l. 脚の回転（膝の向き）: 股関節から足ＩＫまでを、SMPL の膝の向きの側に膝を置いて解く ----
+    # キーは種類ごと（フル・接地優先・移動なし）に build_tracks で解き直す。ここではフルの脚を 9b の当たり判定に使う
+    poles = knee_poles(kin, fps, cfg.leg_keys.pole_one_euro)
+    legs = leg_rotations(skel, center.delta, ik, local, poles, cfg)
+    log_legs(legs, log)
+
     # ---- 9h. 胴に対する手の位置（胴の近くの手首を、胴の寸法の比で移した位置へ 2 ボーン IK で置く） ----
     local, reach = keep_hand_positions(skel, rt, kin.glob_rot, local, rest.joints,
                                        bm.rest_vertices(motion.betas), bm.weights, cfg.hand_reach,
@@ -499,7 +534,8 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     local, limits_pre = limit_wrists(skel, local, cfg.wrist_limits, fps)
     local_before_contacts = local
     local, contacts = resolve_contacts(skel, rt, kin.glob_rot, local, cfg.contacts, cfg.arm_collision,
-                                       cfg.hands.bones, cfg.arm_collision.mode, k, fps, rest.joints)
+                                       cfg.hands.bones, cfg.arm_collision.mode, k, fps, rest.joints,
+                                       leg_glob=None if legs is None else legs.glob)
     log_contacts(contacts, k, log)
 
     # ---- 9c. 手首の可動域（9b で手首を回した分も含めて、人の関節の範囲に収める） ----
@@ -509,7 +545,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     # ---- 10. 捩りボーンへのひねりの振り分け（キーは build_tracks が同じように分けて作る）・VMD 書き出しと診断出力 ----
     twist = split_twist(skel, local, cfg.twist)
     log_twist(twist, log)
-    tracks = build_tracks(skel, center.delta, ik, local, contact, cfg, k)
+    tracks = build_tracks(skel, center.delta, ik, local, contact, cfg, k, poles=poles)
     model_name = cfg.vmd.model_name or skel.model_name or 'nlf2vmd'
     n_keys = 0
     if out_path is not None:
@@ -524,7 +560,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         warnings=warns, depth=depth, ground=ground, lean=lean, hand_reach=reach, arm_collision=arms,
         skeleton=skel, retargeter=rt, wrist=wrist, contacts=contacts, local_before_contacts=local_before_contacts,
         twist=twist, smpl_rest=rest.joints, wrist_limits=limits, outliers=outliers,
-        pelvis_rest=pelvis_rest)
+        pelvis_rest=pelvis_rest, knee_poles=poles, legs=legs)
     result.info = dict(
         frames=motion.num_frames, fps=fps, source_fps=motion.source_fps, scale=k,
         smpl_leg_length_m=smpl_leg, mmd_leg_length=skel.mean_leg_length(),
@@ -532,6 +568,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         fk_check_mm=motion.fk_check_mm, jitter=jitter_info,
         wrist=None if wrist is None else wrist.info,
         hand_reach=reach.info,
+        legs=dict(enabled=False) if legs is None else dict(enabled=True, **legs.info),
         contacts=contacts.info,
         wrist_limits=dict(limits.info, before_contacts={
             k: limits_pre.info[k] for k in ('out_of_range_frames', 'changed_frames', 'max_correction_deg')}),

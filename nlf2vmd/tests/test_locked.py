@@ -7,11 +7,16 @@ from nlf2vmd import convert, load_config, quat
 from nlf2vmd.contact import ContactResult
 from nlf2vmd.filters import runs
 from nlf2vmd.foot_ik import build_foot_ik
+from nlf2vmd.legs import LEG_BONES
 from nlf2vmd.locked import lock_flags, locked_motion, mmd_sole_heights, sole_clearance
 from nlf2vmd.synthetic import add_jump, synthetic_walk
 from nlf2vmd.variants import variant_tracks
 
 FPS = 30.0
+
+
+def _max_angle_deg(a, b):
+    return float(np.rad2deg(quat.angle_between(a, b)).max(initial=0.0))
 
 
 def _convert(body_model, motion, overrides=()):
@@ -68,8 +73,9 @@ def test_both_feet_stay_on_the_floor(jump):
     assert info['one_foot_hover_frames']['after'] == 0 and info['max_highest_sole_cm']['after'] < 0.5
     assert info['exceed_after'] == 0
     full = _tracks(r.tracks)
+    # 脚の回転は、その種類のセンター・足ＩＫで解き直す（足ＩＫと同じく変わる）
     for name, t in _tracks(variant_tracks(r, 'locked', log=None)).items():
-        if name not in ('グルーブ', '左足ＩＫ', '右足ＩＫ'):
+        if name not in ('グルーブ', '左足ＩＫ', '右足ＩＫ') + LEG_BONES:
             np.testing.assert_array_equal(t.positions, full[name].positions)
             np.testing.assert_array_equal(t.rotations, full[name].rotations)
 
@@ -93,14 +99,18 @@ def test_locked_can_be_spliced_with_full(jump_one_foot):
     changed = {name for name, t in full.items()
                if not (np.array_equal(t.positions, locked[name].positions)
                        and np.array_equal(t.rotations, locked[name].rotations))}
-    assert changed <= {'グルーブ', '左足ＩＫ', '右足ＩＫ'}
+    assert changed <= {'グルーブ', '左足ＩＫ', '右足ＩＫ', *LEG_BONES}
     (s, e), = runs(motion['airborne'])
     far = np.ones(len(motion['airborne']), bool)
     far[s - 30:e + 31] = False
     for name in changed:
         np.testing.assert_allclose(locked[name].positions[far], full[name].positions[far],
                                    atol=1e-3 * k)              # 1mm（モデルの足の形で床に合わせ直した分）
-        np.testing.assert_array_equal(locked[name].rotations[far], full[name].rotations[far])
+        if name in LEG_BONES:
+            # 脚の回転は、その 1mm の分だけ解き直した角度が変わる
+            assert _max_angle_deg(locked[name].rotations[far], full[name].rotations[far]) < 1.0
+        else:
+            np.testing.assert_array_equal(locked[name].rotations[far], full[name].rotations[far])
 
 
 def test_center_mode_b_keeps_the_horizontal_center_of_full(body_model):
@@ -170,7 +180,10 @@ def test_motion_without_floating_is_the_same_as_full(body_model):
     for name, t in _tracks(variant_tracks(r, 'locked', log=None)).items():
         # モデルの足の形で、両足とも数 mm 浮いたフレームだけ床に合わせ直す（切り貼りで段差が見えない 5mm 以下）
         np.testing.assert_allclose(t.positions, full[name].positions, atol=5e-3 * r.scale)
-        np.testing.assert_array_equal(t.rotations, full[name].rotations)
+        if name in LEG_BONES:
+            assert _max_angle_deg(t.rotations, full[name].rotations) < 2.0   # その数 mm の分だけ
+        else:
+            np.testing.assert_array_equal(t.rotations, full[name].rotations)
 
 
 def _contact(flags, speeds=None):

@@ -508,6 +508,28 @@ def save_plots(r, out_dir):
     paths['reach_clamp'] = out_dir / 'reach_clamp.png'
     fig.savefig(paths['reach_clamp'], dpi=110)
 
+    # 3b. 脚の回転（膝の向き・曲げ）
+    legs = getattr(r, 'legs', None)
+    if legs is not None:
+        fig = Figure(figsize=(12, 5))
+        axes = fig.subplots(2, 1, sharex=True)
+        for side, ax in enumerate(axes):
+            _bands(ax, r.contact.flags[:, side], 'tab:green', alpha=0.12)
+            _bands(ax, legs.unreached[:, side], 'tab:red', alpha=0.3)
+            ax.plot(frames, legs.knee_out_deg[:, side], color='tab:blue', lw=1.2,
+                    label='knee direction from the pelvis front [deg] (+ = out)')
+            ax.plot(frames, legs.bend_deg[:, side], color='tab:orange', lw=1,
+                    label='knee bend [deg]')
+            ax.axhline(0.0, color='k', lw=0.6)
+            ax.set_ylabel('[deg]')
+            ax.set_title(f'{feet[side].split()[0]} leg keys: green = contact, red = foot IK out of reach',
+                         fontsize=10)
+            ax.legend(loc='upper right', fontsize=8)
+        axes[-1].set_xlabel('frame')
+        fig.tight_layout()
+        paths['legs'] = out_dir / 'legs.png'
+        fig.savefig(paths['legs'], dpi=110)
+
     # 4. 足ＩＫの水平軌跡（上面図）
     fig = Figure(figsize=(12, 6))
     axes = fig.subplots(1, 2)
