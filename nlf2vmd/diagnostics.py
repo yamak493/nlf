@@ -203,6 +203,40 @@ def save_plots(r, out_dir):
     paths = {}
     feet = ('left foot', 'right foot')
 
+    # 0. 慣性・重力による外れフレーム（部位ごとの外れの度合いと、重心の上下・奥行きの推定と重力の条件を満たす軌道）
+    out = getattr(r, 'outliers', None)
+    if out is not None and out.enabled:
+        fig = Figure(figsize=(12, 9))
+        axes = fig.subplots(3, 1, sharex=True)
+        ax = axes[0]
+        colors = dict(torso='tab:red', legs='tab:blue', head='tab:purple', left_arm='tab:green',
+                      right_arm='tab:olive', com='black')
+        for name, score in out.scores.items():
+            ax.plot(frames, np.minimum(score, 5.0), lw=0.8, color=colors.get(name),
+                    label=f'{name} ({int(out.flags[name].sum())} replaced)')
+            _bands(ax, out.flags[name], colors.get(name), alpha=0.15)
+        ax.axhline(1.0, color='0.3', ls='--', lw=0.8)
+        ax.set_ylabel('score (1 = threshold)')
+        ax.set_title('outlier score per part (inertia) and centre of mass (gravity); '
+                     'bands = replaced frames')
+        ax.legend(loc='upper right', fontsize=7, ncol=3)
+        com_frames = out.flags['com'] | out.flags['torso']
+        if out.com is not None:
+            depth_axis = out.depth_axis / np.linalg.norm(out.depth_axis)
+            for ax, label, f in ((axes[1], 'height', lambda c: c[:, 1]),
+                                 (axes[2], 'depth (camera axis)', lambda c: c @ depth_axis)):
+                _bands(ax, com_frames, 'tab:red', alpha=0.15)
+                ax.plot(frames, f(out.com) * 100.0, color='0.5', lw=0.8, label='estimated')
+                if out.com_fit is not None:
+                    ax.plot(frames, f(out.com_fit) * 100.0, color='tab:red', lw=1.0,
+                            label='gravity-consistent')
+                ax.set_ylabel(f'CoM {label} [cm]')
+                ax.legend(loc='upper right', fontsize=8)
+        axes[-1].set_xlabel('frame')
+        fig.tight_layout()
+        paths['outliers'] = out_dir / 'outliers.png'
+        fig.savefig(paths['outliers'], dpi=110)
+
     # 1. 足の高さ・水平速度・接地フラグ
     fig = Figure(figsize=(12, 6))
     axes = fig.subplots(2, 1, sharex=True)

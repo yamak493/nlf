@@ -24,6 +24,7 @@ from .hand_reach import keep_hand_positions
 from .jitter import stabilize_pose, stabilize_root
 from .lean import estimate_lean
 from .motion_io import load_motion
+from .outliers import PART_LABELS, remove_outliers
 from .pmx import PmxModel, read_pmx
 from .retarget import Retargeter
 from .skeleton import REQUIRED_BONES, SIDES, Skeleton
@@ -70,6 +71,7 @@ class ConversionResult:
     local_before_contacts: dict = None   # ステージ9b の前のローカル回転（指の形を入れて 9b をやり直すのに使う）
     twist: object = None         # 捩りボーンへのひねりの振り分け（twist.TwistResult）
     wrist_limits: object = None  # ステージ9c（手首の可動域）の結果（9b の後に掛けたもの）
+    outliers: object = None      # ステージ1b（慣性・重力による外れフレームの除外）の結果
     smpl_rest: np.ndarray = None  # SMPL の初期姿勢の関節（体型を固定したもの）
     skeleton: object = None      # 対象モデルの骨格（variants.py で種類別のキーを作り直すのに使う）
     retargeter: object = None
@@ -155,6 +157,25 @@ def build_tracks(skel, center_delta, ik, local, contact, cfg, unit):
                               forced)
         tracks.append(BoneTrack(name, frames[keep], p[keep], q[keep]))
     return tracks
+
+
+def log_outliers(outliers, fps, log, warn):
+    if not outliers.enabled:
+        log('[1b] 慣性・重力による外れフレーム: 扱いません')
+        return
+    info = outliers.info
+    parts = '・'.join(f'{PART_LABELS[k]} {n}' for k, n in info['frames'].items())
+    log(f'[1b] 慣性・重力による外れフレーム: {parts} フレームを置き換えました（計 {info["replaced_frames"]} '
+        f'フレーム・{info["ratio"] * 100:.1f}%。うち床・接地・奥行き・傾きの推定に使わないもの '
+        f'{info["unobserved_frames"]}）')
+    for name, reason in outliers.skipped.items():
+        warn(f'{PART_LABELS[name]}の外れ: {reason}。outliers.png を確認してください')
+    if outliers.long_runs:
+        runs_ = ', '.join(f'{PART_LABELS[n]} {s / fps:.1f}〜{(e + 1) / fps:.1f} 秒'
+                          for n, s, e in outliers.long_runs[:5])
+        more = f' ほか {len(outliers.long_runs) - 5} 区間' if len(outliers.long_runs) > 5 else ''
+        warn(f'外れらしい動きが長く続く区間があります（{runs_}{more}）。前後どちらが正しいのか'
+             '決められないので置き換えていません')
 
 
 def log_contacts(contacts, unit, log, label='[9b]'):
@@ -306,8 +327,25 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         if motion.fk_check_mm > 20.0:
             warn('体モデルと入力の関節位置が一致しません。体モデルのファイルを確認してください')
 
-    # ---- 2. 姿勢のジッター制御 ----
+    # ---- 1b. 慣性・重力による外れフレームの除外 ----
+    # 重力の向き（床の法線）は、外れを除く前の体で仮に求める（ステージ4で外れを除いた体から求め直す）
+    rest = rest_info(bm, motion.betas, int(cfg.body.heel_toe_vertices),
+                     float(cfg.body.sole_band_m))
     rest_joints = bm.rest_joints(motion.betas)
+    valid_input = valid
+    outliers = None
+    if cfg.outliers.enabled:
+        pre_floor = estimate_floor(compute_kinematics(motion.quats, motion.root_pos, rest), fps,
+                                   cfg.floor, rest.points.mean(2), valid)
+        outliers = remove_outliers(motion.quats, motion.root_pos, valid, rest_joints, bm.parents,
+                                   fps, cfg.outliers, pre_floor.rotation,
+                                   depth_axis(pre_floor.rotation))
+        motion = replace(motion, quats=outliers.quats, root_pos=outliers.root_pos,
+                         valid=outliers.valid)
+        valid = outliers.valid
+        log_outliers(outliers, fps, log, warn)
+
+    # ---- 2. 姿勢のジッター制御 ----
     quats, jitter_info = stabilize_pose(motion.quats, fps, cfg.jitter, rest_joints)
     root = stabilize_root(motion.root_pos, cfg.jitter.root_median_window)
     hold = ''
@@ -342,8 +380,6 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
             log('[2b] 手首の向きの補正（MediaPipe）: ' + ' / '.join(parts))
 
     # ---- 3. FK で関節位置・かかと・つま先を算出 ----
-    rest = rest_info(bm, motion.betas, int(cfg.body.heel_toe_vertices),
-                     float(cfg.body.sole_band_m))
     kin = compute_kinematics(quats, root, rest)
     kin_raw = compute_kinematics(motion.quats, motion.root_pos, rest)   # 診断の「処理前」用
 
@@ -379,7 +415,9 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     # 前後の傾きは 1 回目の接地判定のあとに 1 度だけ求める。足首から下は動かさないので接地判定は変わらず、
     # 奥行きの再構成は傾きを補正した足首→骨盤の相対位置を使う（平滑化する前の姿勢にも同じ補正を掛ける）
     axis = depth_axis(floor.rotation)
-    ground = ground_offset(kin, fps, k, cfg.ground, valid)
+    # 接地の拘束は、検出できなかった（補間しただけの）フレームだけをジャンプにしない。外れとして置き換えた
+    # フレームは、重力で動ける上下の動き（ステージ1b）なので、ジャンプの途中でもそのまま使う
+    ground = ground_offset(kin, fps, k, cfg.ground, valid_input)
     judged = ground.apply(kin)
     kin_pose, lean = kin_raw, None
     for _ in range(max(1, int(cfg.depth.passes)) if cfg.depth.reconstruct else 1):
@@ -391,7 +429,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
             kin, kin_pose = lean.apply(kin), lean.apply(kin_raw)
         depth = reconstruct_depth(kin, kin_pose, contact, axis, fps, k, cfg.depth, valid)
         moved = depth.apply(kin)
-        ground = ground_offset(moved, fps, k, cfg.ground, valid, contact)
+        ground = ground_offset(moved, fps, k, cfg.ground, valid_input, contact)
         judged = ground.apply(moved)
     kin = judged
     # 接地判定の高さを最後の体の高さにする（足ＩＫの床への吸着は、同じ体の「足首 − 足裏」の高さを使う。
@@ -484,7 +522,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         ik, center, ankle_rest, geom, rt.global_matrix('下半身', kin_raw.glob_rot), local, tracks,
         warnings=warns, depth=depth, ground=ground, lean=lean, hand_reach=reach, arm_collision=arms,
         skeleton=skel, retargeter=rt, wrist=wrist, contacts=contacts, local_before_contacts=local_before_contacts,
-        twist=twist, smpl_rest=rest.joints, wrist_limits=limits)
+        twist=twist, smpl_rest=rest.joints, wrist_limits=limits, outliers=outliers)
     result.info = dict(
         frames=motion.num_frames, fps=fps, source_fps=motion.source_fps, scale=k,
         smpl_leg_length_m=smpl_leg, mmd_leg_length=skel.mean_leg_length(),
@@ -496,8 +534,9 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         wrist_limits=dict(limits.info, before_contacts={
             k: limits_pre.info[k] for k in ('out_of_range_frames', 'changed_frames', 'max_correction_deg')}),
         twist=twist.info,
-        interpolated=dict(frames=int((~valid).sum()), segments=len(gaps),
+        interpolated=dict(frames=int((~valid_input).sum()), segments=len(gaps),
                           longest_sec=round(float(longest_gap), 3)),
+        outliers=dict(enabled=False) if outliers is None else outliers.info,
         floor=dict(tilt_deg=floor.tilt_deg, tilt_applied=floor.tilt_applied,
                    tilt_mode=floor.tilt_mode,
                    normal=floor.normal.tolist(), points=floor.num_points,
