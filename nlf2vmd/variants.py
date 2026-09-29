@@ -179,7 +179,7 @@ def log_locked(info, fps, log):
             f'{SAME_ROT_DEG:g} 度以下）')
     if info['exceed_after']:
         log(f'⚠️ [接地優先] {info["exceed_after"]} フレームで脚が伸び切っています（床へ下ろした足に脚が届きません。'
-            'center.reach_max_drop_m を大きくすると下げられます）')
+            'locked.reach_max_drop_m を大きくすると下げられます）')
 
 
 def variant_tracks(result, kind, log=print):

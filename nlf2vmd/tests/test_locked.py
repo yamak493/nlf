@@ -12,6 +12,9 @@ from nlf2vmd.synthetic import add_jump, synthetic_walk
 from nlf2vmd.variants import variant_tracks
 
 FPS = 30.0
+# フルと同じ所は同じ値になることを確かめる設定（片足だけの浮きは残し、届く高さもフルと同じ 98%。合成の歩行は
+# 脚が 97% ほど伸びているので、既定の 95% ではどのフレームでもセンターが下がる）
+SAME_AS_FULL = ['locked.both_feet=false', 'locked.reach_ratio=0.98', 'locked.reach_max_drop_m=0.3']
 
 
 def _convert(body_model, motion, overrides=()):
@@ -30,7 +33,7 @@ def jump(body_model):
 def jump_one_foot(body_model):
     """jump と同じ動きを locked.both_feet: false（片足だけの浮きは残す）で。"""
     motion = add_jump(synthetic_walk(num_frames=300, speed=0.0, seed=0), 5.0, 0.45, 0.25)
-    return motion, _convert(body_model, motion, ['locked.both_feet=false'])
+    return motion, _convert(body_model, motion, SAME_AS_FULL)
 
 
 def _tracks(tracks):
@@ -161,9 +164,23 @@ def test_tilted_foot_touches_the_floor_with_the_model_foot(body_model):
     assert lm.info['exceed_after'] == 0
 
 
+def test_legs_keep_a_margin_so_mmd_ik_can_reach_the_floor(body_model):
+    """床へ下ろした足に、MMD の IK が確実に届くように、股関節から足ＩＫまでを脚長の 95% 以下にする
+    （フルは 98%。脚がほとんど伸び切った所では、MMD の IK が足首を届かせられず、足が宙に残る）。"""
+    motion = add_jump(synthetic_walk(num_frames=300, speed=0.0, lift=0.35, seed=0), 4.95, 0.25, 0.08)
+    r = _convert(body_model, motion)
+    lm = locked_motion(r)
+    g = r.reach_geometry
+    lower = r.retargeter.global_matrix('下半身', r.kin.glob_rot)
+    stretch = g.distances(lm.center.delta, lower, lm.foot_ik.delta) / g.leg_length
+    assert stretch.max() <= r.config.locked.reach_ratio + 1e-6
+    assert (g.distances(r.center.delta, lower, r.foot_ik.delta) / g.leg_length).max() > 0.96
+    assert lm.info['exceed_after'] == 0 and lm.info['max_highest_sole_cm']['after'] < 0.01
+
+
 def test_motion_without_floating_is_the_same_as_full(body_model):
     r = _convert(body_model, synthetic_walk(num_frames=240, speed=0.0, noise_deg=1.0),
-                 ['locked.both_feet=false'])
+                 SAME_AS_FULL)
     lm = locked_motion(r)
     assert lm.info['differ_frames'] == [] and lm.info['added_lock_frames'] == [0, 0]
     full = _tracks(r.tracks)

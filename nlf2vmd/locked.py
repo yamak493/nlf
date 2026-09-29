@@ -25,7 +25,11 @@
    足ＩＫを作り直したあと、もう一度モデルの足の形で高さを求め、足裏の最も低い点がちょうど床に来るように上下を
    合わせる（both_feet なら両足。false なら両足とも浮いたときの低いほうの足）
 5. センターは、骨盤・足首を 1. だけ下ろした体と 4. の足ＩＫ・接地で、ステージ8（平滑化と届く高さへのクランプ）を
-   やり直して求める（体を下ろさない所は、足ＩＫが変わった分だけクランプが変わる）。水平（X・Z）はフルと同じにする
+   やり直して求める（体を下ろさない所は、足ＩＫが変わった分だけクランプが変わる）。水平（X・Z）はフルと同じにする。
+   届く高さへのクランプは、フル（center.reach_ratio 0.98・下げる量の上限 0.3m）より余裕を持たせる
+   （locked.reach_ratio 0.95・上限 locked.reach_max_drop_m）。脚がほとんど伸び切った所に足ＩＫがあると、MMD の IK
+   （ひざの角度制限つきの繰り返し計算）が足首を足ＩＫまで届かせられず、床に下ろした足が宙に残る（まっすぐな脚で
+   つま先立ちのまま浮いて見える）ため
 
 回転（上半身・腕・下半身など）とセンターの水平移動はフルと同じ。浮いていたフレームから離れた所では、センター・
 グルーブ・足ＩＫもフルと同じ値になるので、2 つの VMD の好きな所を切り貼りできる（フルと違うフレームは
@@ -39,6 +43,7 @@ from scipy.ndimage import maximum_filter1d
 from . import filters, quat
 from .body_model import ANKLES
 from .center import apply_reach_clamp, stabilize_center
+from .config import Config
 from .contact import ContactResult, clean_flags, hysteresis
 from .foot_ik import build_foot_ik
 from .ground import support_height
@@ -205,13 +210,15 @@ def locked_motion(result):
     body = np.zeros((T, 3))
     body[:, 1] = jump
     lower_rot = rt.global_matrix('下半身', kin.glob_rot)
+    cfg_center = Config(dict(cfg.center, reach_ratio=float(cfg.locked.reach_ratio),
+                             reach_max_drop_m=float(cfg.locked.reach_max_drop_m)))
     center = stabilize_center(result.kin_raw.root_pos, kin.root_pos - body, result.pelvis_rest,
                               kin.joints[:, ANKLES] - body[:, None], ik, locked_contact,
-                              result.reach_geometry, lower_rot, fps, k, cfg.center)
+                              result.reach_geometry, lower_rot, fps, k, cfg_center)
     smoothed = np.array(center.smoothed, copy=True)
     smoothed[:, [0, 2]] = result.center.smoothed[:, [0, 2]]
     delta, corr_raw, corr, exceed_before, exceed_after = apply_reach_clamp(
-        result.reach_geometry, smoothed, lower_rot, ik.delta, cfg.center, k)
+        result.reach_geometry, smoothed, lower_rot, ik.delta, cfg_center, k)
     center = replace(center, delta=delta, smoothed=smoothed, correction_raw=corr_raw,
                      correction=corr, exceed_before=exceed_before, exceed_after=exceed_after)
 
