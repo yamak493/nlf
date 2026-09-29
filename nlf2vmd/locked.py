@@ -8,8 +8,10 @@
 
 1. ジャンプとして残した区間（ステージ6a の滞空）で、体（姿勢）が床から浮いている高さ（接地している足があれば
    その足、無ければ両足の、足裏の最も低い点の高さ。ステージ6a と同じ）を求め、軽くならす（locked.sigma_frames）
-2. フルの出力の足ＩＫでの足裏の高さ（床からの浮き）を足ごとに求める。足ＩＫの差分 Y が 0 なら、MMD のモデルの足は
-   直立したときの位置（足裏が床）にあるので、浮きは差分 Y 以下とする
+2. フルの出力の足ＩＫでの足裏の高さ（床からの浮き）を足ごとに求める。高さは MMD のモデルの足の形で求める
+   （mmd_sole_heights。足ＩＫの位置に、足ＩＫの回転で回したかかと（足首の真下の床の点）とつま先（つま先ＩＫの真下の
+   床の点）を置いた低いほう）。SMPL の足の形で求めると、足首の高さ・足の長さの比がモデルと違うので、かかとを
+   上げて足を傾けたとき（足を引き寄せる・つま先で立つ）に、SMPL ではつま先が床に着いていても、モデルでは浮く
 3. 足ＩＫを下ろす。locked.both_feet なら、足ごとにその足の浮きだけ下ろす（両足とも足裏がちょうど床に着く）。
    false なら、下ろす量は両足の浮きの小さいほう（両足とも浮いているフレームで、低いほうの足が床に着くまで）と
    1. の大きいほうで、足ごとに、その足の浮きより下へは下ろさない（低いほうの足はちょうど床に着き、高いほうの足は
@@ -20,6 +22,8 @@
    延ばしたフレームはフルの接地区間のロック位置・回転をそのまま保つ（前後 2 つの接地区間とつながったときは、2 つの
    ロック位置・回転の間をなめらかにつなぐ）。どの接地区間ともつながらない所は、フルと同じしきい値で接地を判定し、
    足首が動かない区間だけ固定する（lock_flags）。水平に動いている足は固定せず、床の高さへ下ろすだけ
+   足ＩＫを作り直したあと、もう一度モデルの足の形で高さを求め、足裏の最も低い点がちょうど床に来るように上下を
+   合わせる（both_feet なら両足。false なら両足とも浮いたときの低いほうの足）
 5. センターは、骨盤・足首を 1. だけ下ろした体と 4. の足ＩＫ・接地で、ステージ8（平滑化と届く高さへのクランプ）を
    やり直して求める（体を下ろさない所は、足ＩＫが変わった分だけクランプが変わる）。水平（X・Z）はフルと同じにする
 
@@ -36,9 +40,9 @@ from . import filters, quat
 from .body_model import ANKLES
 from .center import apply_reach_clamp, stabilize_center
 from .contact import ContactResult, clean_flags, hysteresis
-from .diagnostics import output_sole_heights
 from .foot_ik import build_foot_ik
 from .ground import support_height
+from .skeleton import SIDES
 
 HOVER_M = 0.01      # 足裏がこれより上 [m] なら「浮いている」（ログ・info の数え方）
 SAME_POS_M = 0.005  # フルとの差がこれ以下 [m]・SAME_ROT_DEG 度以下なら「フルと同じ」（切り貼りしても段差が見えない）
@@ -65,9 +69,52 @@ def jump_height(result):
     return np.where(np.asarray(flight, bool), np.maximum(height, 0.0), 0.0)
 
 
+def mmd_sole_points(skel):
+    """(2, 2, 3) 左右の足の、足ＩＫの初期位置から見た かかと・つま先 の床の点（内部座標）。
+
+    かかとは足首（足ＩＫ）の真下、つま先はつま先ＩＫ（無ければつま先）の真下の床（y = 0）。
+    """
+    out = np.zeros((2, 2, 3))
+    for side, s in enumerate(SIDES):
+        ik = skel.internal(s + '足ＩＫ')
+        toe = next((skel.internal(s + n) for n in ('つま先ＩＫ', 'つま先') if skel.has(s + n)),
+                   ik + np.array([0.0, 0.0, 0.13 * skel.leg_length(side)]))
+        out[side, 0] = [0.0, -ik[1], 0.0]
+        out[side, 1] = [toe[0] - ik[0], -ik[1], toe[2] - ik[2]]
+    return out
+
+
+def mmd_sole_heights(skel, ik):
+    """(T, 2) MMD のモデルの足裏（かかと・つま先の低いほう）の床からの高さ（足ＩＫの位置と回転から）。"""
+    points = mmd_sole_points(skel)
+    rest_y = np.array([skel.internal(s + '足ＩＫ')[1] for s in SIDES])
+    heights = np.empty(np.shape(ik.delta)[:2] + (2,))
+    for side in range(2):
+        for i in range(2):
+            heights[:, side, i] = quat.rotate(ik.rotation[:, side],
+                                              np.broadcast_to(points[side, i], (len(ik.delta), 3)))[:, 1]
+    return rest_y + ik.delta[..., 1] + heights.min(-1)
+
+
+def ground_feet(skel, ik, both_feet):
+    """足ＩＫを上下に動かして、モデルの足裏を床に合わせた FootIKResult（4. の最後）。
+
+    both_feet なら両足とも足裏の最も低い点をちょうど床に（浮いていれば下ろし、埋まっていれば上げる）。false なら、
+    両足とも浮いているフレームだけ、低いほうの足が床に着くまで両足を下ろす（床より下へは下ろさない）。
+    """
+    sole = mmd_sole_heights(skel, ik)
+    if both_feet:
+        shift = sole
+    else:
+        shift = np.minimum(np.maximum(sole.min(1), 0.0)[:, None], np.maximum(sole, 0.0))
+    delta = np.array(ik.delta, copy=True)
+    delta[..., 1] -= shift
+    return replace(ik, delta=delta, target=np.asarray(ik.target) + (delta - ik.delta))
+
+
 def sole_clearance(result):
-    """(T, 2) フルの出力の足ＩＫでの、足裏の床からの高さ（2.）。"""
-    return np.minimum(output_sole_heights(result), result.foot_ik.delta[..., 1])
+    """(T, 2) フルの出力の足ＩＫでの、モデルの足裏の床からの高さ（2.）。"""
+    return mmd_sole_heights(result.skeleton, result.foot_ik)
 
 
 def foot_drops(clearance, jump, both_feet=True):
@@ -151,6 +198,7 @@ def locked_motion(result):
     ik = build_foot_ik(ik_full.raw - down, result.ankle_rest, rt.foot_ik_quats(kin.glob_rot),
                        locked_contact, fps, k, cfg.foot_ik, swing=ik_full.swing - down,
                        anchor=contact.flags)
+    ik = ground_feet(result.skeleton, ik, bool(cfg.locked.both_feet))
 
     # 5. 体を下ろしてセンターを求め直す（ジャンプの高さはステージ8の平滑化の前に除く）。水平はフルと同じにして
     # （モードB は接地している足から骨盤を求めるので、固定した足を足すと水平も少し変わる）、クランプを掛け直す
@@ -167,7 +215,7 @@ def locked_motion(result):
     center = replace(center, delta=delta, smoothed=smoothed, correction_raw=corr_raw,
                      correction=corr, exceed_before=exceed_before, exceed_after=exceed_after)
 
-    sole_after = np.minimum(output_sole_heights(result, ik, locked_contact), ik.delta[..., 1])
+    sole_after = mmd_sole_heights(result.skeleton, ik)
     flight = getattr(result.ground, 'flight', None)
     rot_diff = np.rad2deg(quat.angle_between(ik.rotation, ik_full.rotation)).max(1)
     differ = ((np.abs(center.delta - result.center.delta).max(1) > SAME_POS_M * k)

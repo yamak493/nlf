@@ -7,7 +7,7 @@ from nlf2vmd import convert, load_config, quat
 from nlf2vmd.contact import ContactResult
 from nlf2vmd.filters import runs
 from nlf2vmd.foot_ik import build_foot_ik
-from nlf2vmd.locked import lock_flags, locked_motion, sole_clearance
+from nlf2vmd.locked import lock_flags, locked_motion, mmd_sole_heights, sole_clearance
 from nlf2vmd.synthetic import add_jump, synthetic_walk
 from nlf2vmd.variants import variant_tracks
 
@@ -99,7 +99,7 @@ def test_locked_can_be_spliced_with_full(jump_one_foot):
     far[s - 30:e + 31] = False
     for name in changed:
         np.testing.assert_allclose(locked[name].positions[far], full[name].positions[far],
-                                   atol=1e-3 * k / 10.0)       # 0.1mm
+                                   atol=1e-3 * k)              # 1mm（モデルの足の形で床に合わせ直した分）
         np.testing.assert_array_equal(locked[name].rotations[far], full[name].rotations[far])
 
 
@@ -136,6 +136,31 @@ def test_raised_leg_that_looks_like_a_hop_keeps_the_support_foot_down(body_model
     assert (lm.center.delta[air, 1].max() - before) / k < 0.005
 
 
+def _tilt_swing_feet(motion, deg):
+    """遊脚の間だけ、足首をつま先が下がる向きに最大 deg 度回す（かかとを上げて、つま先を床に擦って足を寄せる）。"""
+    q = quat.from_rotvec(np.asarray(motion['pose'], float))
+    t = np.arange(len(q)) / float(motion['fps'])
+    envelope = np.sin(np.pi * ((t / 0.6) % 1.0)) ** 2
+    for side in range(2):
+        angle = np.deg2rad(deg) * envelope * ~motion['stance'][:, side]
+        q[:, 7 + side] = quat.mul(q[:, 7 + side], quat.from_rotvec(angle[:, None] * [1.0, 0.0, 0.0]))
+    return dict(motion, pose=quat.to_rotvec(q))
+
+
+def test_tilted_foot_touches_the_floor_with_the_model_foot(body_model):
+    """かかとを上げてつま先で足を寄せると、SMPL の足の形ではつま先が床に着いていても、モデルの足（足首の高さ・足の長さの
+    比が違う）では浮く。接地優先は、モデルの足の形で、足裏の最も低い点をちょうど床に着ける。"""
+    from nlf2vmd.diagnostics import output_sole_heights
+    motion = _tilt_swing_feet(synthetic_walk(num_frames=240, speed=0.3, lift=0.0), 35.0)
+    r = _convert(body_model, motion)
+    k = r.scale
+    smpl = np.minimum(output_sole_heights(r), r.foot_ik.delta[..., 1])
+    assert np.abs(sole_clearance(r) - smpl).max() / k > 0.03       # 足の形の違いで 3cm 以上ずれる
+    lm = locked_motion(r)
+    np.testing.assert_allclose(mmd_sole_heights(r.skeleton, lm.foot_ik), 0.0, atol=1e-9)
+    assert lm.info['exceed_after'] == 0
+
+
 def test_motion_without_floating_is_the_same_as_full(body_model):
     r = _convert(body_model, synthetic_walk(num_frames=240, speed=0.0, noise_deg=1.0),
                  ['locked.both_feet=false'])
@@ -143,7 +168,8 @@ def test_motion_without_floating_is_the_same_as_full(body_model):
     assert lm.info['differ_frames'] == [] and lm.info['added_lock_frames'] == [0, 0]
     full = _tracks(r.tracks)
     for name, t in _tracks(variant_tracks(r, 'locked', log=None)).items():
-        np.testing.assert_array_equal(t.positions, full[name].positions)
+        # モデルの足の形で、両足とも数 mm 浮いたフレームだけ床に合わせ直す（切り貼りで段差が見えない 5mm 以下）
+        np.testing.assert_allclose(t.positions, full[name].positions, atol=5e-3 * r.scale)
         np.testing.assert_array_equal(t.rotations, full[name].rotations)
 
 
