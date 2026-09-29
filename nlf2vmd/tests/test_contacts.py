@@ -57,8 +57,13 @@ def hand_pmx(tmp_path, rigids=None, vertices=None, extra_bones=()):
     return path
 
 
+# 9b だけを見る（ステージ9h（胴に対する手の位置）は、回転のコピーで胴に入り込んだ手を胴の外へ移すので、
+# 入り込んだ姿勢を作るこのテストでは切る）
+ONLY_9B = ['hand_reach.enabled=false']
+
+
 def _convert(body_model, motion, pmx, extra=()):
-    cfg = load_config(overrides=['diagnostics.enabled=false', *extra])
+    cfg = load_config(overrides=['diagnostics.enabled=false', *ONLY_9B, *extra])
     return convert(motion, None, pmx=pmx, body_model=body_model, config=cfg, log=None)
 
 
@@ -299,7 +304,7 @@ def test_body_from_mesh_when_there_are_no_rigid_bodies(tmp_path):
 
 def test_contacts_plot(tmp_path, body_model):
     pytest.importorskip('matplotlib')
-    cfg = load_config()
+    cfg = load_config(overrides=ONLY_9B)
     r = convert(_press(), None, pmx=hand_pmx(tmp_path), body_model=body_model, config=cfg,
                 diag_dir=tmp_path / 'diag', log=None)
     assert (tmp_path / 'diag' / 'contacts.png').exists()
