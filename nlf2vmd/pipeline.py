@@ -498,7 +498,8 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     geom = ReachGeometry.from_skeleton(skel)
     center = stabilize_center(kin_raw.root_pos, kin.root_pos, pelvis_rest,
                               kin.joints[:, ANKLES], ik, contact, geom,
-                              rt.global_matrix('下半身', kin.glob_rot), fps, k, cfg.center)
+                              rt.global_matrix('下半身', kin.glob_rot), fps, k, cfg.center,
+                              depth.enabled)
     log(f'[8] センター（モード {center.mode}）: 脚の伸び切り {center.exceed_before} → '
         f'{center.exceed_after} フレーム')
     if center.exceed_after:

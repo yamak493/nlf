@@ -48,3 +48,33 @@ def test_center_modes_run_and_never_raise(run_walk):
         assert (r.center.correction <= 0).all()
         assert (r.center.delta[:, 1] <= r.center.smoothed[:, 1] + 1e-12).all()
         assert r.center.exceed_after == 0
+
+
+def _sway_amplitude(x, fps, hz):
+    """x (T,) の hz の成分の振幅（一定速度の移動は除く）。"""
+    t = np.arange(len(x)) / fps
+    A = np.stack([np.sin(2 * np.pi * hz * t), np.cos(2 * np.pi * hz * t), np.ones_like(t), t], 1)
+    c = np.linalg.lstsq(A, x, rcond=None)[0]
+    return np.hypot(c[0], c[1])
+
+
+def test_center_z_keeps_the_reconstructed_depth_sway(run_walk):
+    """足を床に着けたままの前後の体重移動は、ステージ6b で求め直した奥行きに残り、ステージ8（モードA）が
+    さらに削らない（Z を 0.5Hz で平滑化していた頃は 1Hz の揺れが 3 割ほどしか残らなかった）。"""
+    _, r = run_walk(num_frames=300, speed=0.0, sway=0.06, sway_hz=1.0)
+    before = _sway_amplitude(r.kin.root_pos[:, 2], r.fps, 1.0)       # 6b の後
+    after = _sway_amplitude(r.center.delta[:, 2], r.fps, 1.0)
+    assert before > 0.04 * r.scale
+    assert after > 0.65 * before
+
+
+def test_center_z_is_smoothed_harder_without_depth_reconstruction():
+    """6b で奥行きを求め直していない（depth.reconstruct: false）ときは、Z に z_raw の強い平滑化を掛ける。"""
+    from nlf2vmd.center import _axis_one_euro
+    cfg = load_config().center
+    rng = np.random.default_rng(0)
+    p = rng.normal(0, 0.03 * UNIT, (300, 3))
+    rec = _axis_one_euro(p, 30.0, UNIT, cfg, True)
+    raw = _axis_one_euro(p, 30.0, UNIT, cfg, False)
+    np.testing.assert_array_equal(rec[:, :2], raw[:, :2])
+    assert np.abs(np.diff(raw[:, 2], 2)).mean() < 0.5 * np.abs(np.diff(rec[:, 2], 2)).mean()

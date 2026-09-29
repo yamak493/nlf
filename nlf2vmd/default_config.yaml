@@ -173,10 +173,14 @@ foot_ik:
 # ---- 8. センターの安定化 ----
 center:
   mode: A                   # A: 軸別平滑化 / B: 接地足からの逆算
-  axis_one_euro:            # モードA: 骨盤位置の軸別 One Euro [m 単位]。奥行き(Z)を最も強く
+  axis_one_euro:            # モードA: 骨盤位置の軸別 One Euro [m 単位]
     x: {min_cutoff: 1.5, beta: 0.5}
     y: {min_cutoff: 1.5, beta: 0.5}
-    z: {min_cutoff: 0.5, beta: 0.3}
+    # 奥行き(Z): ステージ6b で接地している足から求め直した奥行き（depth.reconstruct: true）には x と同じ強さで掛ける。
+    # 前後のなめらかさは 6b の depth.accel_sigma_m_per_s2 で調整する（ここを強くすると、足ＩＫは 6b の位置で固定されたまま
+    # 骨盤だけがならされ、前後のステップ・体重移動が小さくなり、膝の曲がりも変わる）
+    z: {min_cutoff: 1.5, beta: 0.5}
+    z_raw: {min_cutoff: 0.5, beta: 0.3}   # depth.reconstruct: false のときの Z（推定の奥行きのぶれがそのまま残るので最も強く）
   d_cutoff: 1.0
   zero_phase: true
   mode_b:

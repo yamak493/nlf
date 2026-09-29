@@ -53,10 +53,13 @@ class CenterResult:
     mode: str
 
 
-def _axis_one_euro(p, fps, unit, cfg):
+def _axis_one_euro(p, fps, unit, cfg, depth_reconstructed):
     ax = cfg.axis_one_euro
-    mc = np.array([ax.x.min_cutoff, ax.y.min_cutoff, ax.z.min_cutoff])
-    beta = np.array([ax.x.beta, ax.y.beta, ax.z.beta])
+    # 奥行きをステージ6b で求め直した後は、加速度の項ですでになめらか。ここで強く平滑化すると、足ＩＫを
+    # 固定した位置と骨盤がずれる（前後のステップが小さくなり、膝の曲がりが変わる）
+    z = ax.z if depth_reconstructed else ax.z_raw
+    mc = np.array([ax.x.min_cutoff, ax.y.min_cutoff, z.min_cutoff])
+    beta = np.array([ax.x.beta, ax.y.beta, z.beta])
     return filters.one_euro(p / unit, fps, mc, beta, cfg.d_cutoff, cfg.zero_phase) * unit
 
 
@@ -124,11 +127,14 @@ def reach_correction(geom, center_delta, lower_rot, ik_delta, ratio, max_drop):
 
 
 def stabilize_center(pelvis_raw, pelvis, pelvis_rest, ankles, ik, contact, geom, lower_rot,
-                     fps, unit, cfg):
-    """pelvis_raw: 処理前の骨盤位置 / pelvis: ステージ2 後の骨盤位置（どちらも (T, 3)）。"""
+                     fps, unit, cfg, depth_reconstructed=True):
+    """pelvis_raw: 処理前の骨盤位置 / pelvis: ステージ2 後の骨盤位置（どちらも (T, 3)）。
+
+    depth_reconstructed: ステージ6b で骨盤の奥行きを求め直したか（モードA の Z の平滑化の強さを選ぶ）。
+    """
     mode = str(cfg.mode).upper()
     if mode == 'A':
-        smooth = _axis_one_euro(pelvis, fps, unit, cfg)
+        smooth = _axis_one_euro(pelvis, fps, unit, cfg, depth_reconstructed)
     elif mode == 'B':
         smooth = pelvis_from_contacts(pelvis, ankles, ik.target, contact, fps, unit, cfg)
     else:
