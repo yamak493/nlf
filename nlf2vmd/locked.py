@@ -1,17 +1,19 @@
-"""フル [接地優先]（motion_full_locked.vmd）: ジャンプ・片足上げなどで両足が床から離れる所も、どちらかの足を床に着ける。
+"""フル [接地優先]（motion_full_locked.vmd）: ジャンプ・片足上げなどで足が床から離れる所も、足を床に着ける。
 
 フル（convert の結果）は、ジャンプ（ステージ6a で、骨盤が重力の放物線を描く短い滞空）の高さをそのまま残す。
 単眼推定では、片足を上げたときに体全体が持ち上がって見え、それがジャンプと判定されたり、支持脚が接地判定から
 漏れて床の上を漂ったりする。フル [接地優先] は、フルの動きから次のように作る（ジャンプはしなかったものとし、
-どのフレームでもどちらかの足を床に着ける）。
+既定（locked.both_feet: true）では、どのフレームでも両足を床に着ける。片足を上げる動きも、足を床に着けたまま
+床の上を動かす動きになる。false なら、片足だけの浮きは残し、両足とも浮いたときだけ低いほうの足を床に着ける）。
 
 1. ジャンプとして残した区間（ステージ6a の滞空）で、体（姿勢）が床から浮いている高さ（接地している足があれば
    その足、無ければ両足の、足裏の最も低い点の高さ。ステージ6a と同じ）を求め、軽くならす（locked.sigma_frames）
 2. フルの出力の足ＩＫでの足裏の高さ（床からの浮き）を足ごとに求める。足ＩＫの差分 Y が 0 なら、MMD のモデルの足は
    直立したときの位置（足裏が床）にあるので、浮きは差分 Y 以下とする
-3. 足ＩＫを下ろす。下ろす量は、両足の浮きの小さいほう（両足とも浮いているフレームで、低いほうの足が床に
-   着くまで）と 1. の大きいほうで、足ごとに、その足の浮きより下へは下ろさない（低いほうの足はちょうど床に着き、
-   高いほうの足は体と一緒に下りる。床より下へは下ろさない）
+3. 足ＩＫを下ろす。locked.both_feet なら、足ごとにその足の浮きだけ下ろす（両足とも足裏がちょうど床に着く）。
+   false なら、下ろす量は両足の浮きの小さいほう（両足とも浮いているフレームで、低いほうの足が床に着くまで）と
+   1. の大きいほうで、足ごとに、その足の浮きより下へは下ろさない（低いほうの足はちょうど床に着き、高いほうの足は
+   体と一緒に下りる。床より下へは下ろさない）
 4. 足を大きく下ろしたフレーム（接地判定の開始の高さ contact.enter_height_m より下ろした所と、その前後
    foot_ik.blend_frames。フルでは足の高さのせいで接地にならなかった所）で、床の近くにある足を床に固定する
    （足ＩＫのロック）。フルの接地区間は、足首がそのロック位置から水平に locked.still_m 以内にある間だけ前後へ延ばし、
@@ -68,9 +70,11 @@ def sole_clearance(result):
     return np.minimum(output_sole_heights(result), result.foot_ik.delta[..., 1])
 
 
-def foot_drops(clearance, jump):
+def foot_drops(clearance, jump, both_feet=True):
     """(T, 2) 足ＩＫを下ろす量（3.）。"""
     clearance = np.asarray(clearance, np.float64)
+    if both_feet:
+        return np.maximum(clearance, 0.0)
     drop = np.maximum(np.maximum(clearance.min(1), 0.0), jump)
     return np.minimum(drop[:, None], np.maximum(clearance, 0.0))
 
@@ -127,7 +131,7 @@ def locked_motion(result):
     # 1〜3. 体（姿勢）と足ＩＫを下ろす量
     jump = filters.gaussian_time(jump_height(result), float(cfg.locked.sigma_frames))
     clearance = sole_clearance(result)
-    foot_drop = foot_drops(clearance, jump)
+    foot_drop = foot_drops(clearance, jump, bool(cfg.locked.both_feet))
     down = np.zeros((T, 2, 3))
     down[..., 1] = foot_drop
 
@@ -176,6 +180,10 @@ def locked_motion(result):
         added_lock_frames=[int((flags[:, f] & ~contact.flags[:, f]).sum()) for f in range(2)],
         hover_frames=dict(before=int((clearance.min(1) > HOVER_M * k).sum()),
                           after=int((sole_after.min(1) > HOVER_M * k).sum())),
+        one_foot_hover_frames=dict(before=int((clearance.max(1) > HOVER_M * k).sum()),
+                                   after=int((sole_after.max(1) > HOVER_M * k).sum())),
+        max_highest_sole_cm=dict(before=float(clearance.max(1).max(initial=0.0) / k * 100.0),
+                                 after=float(sole_after.max(1).max(initial=0.0) / k * 100.0)),
         max_lowest_sole_cm=dict(before=float(clearance.min(1).max(initial=0.0) / k * 100.0),
                                 after=float(sole_after.min(1).max(initial=0.0) / k * 100.0)),
         exceed_before=center.exceed_before, exceed_after=center.exceed_after,

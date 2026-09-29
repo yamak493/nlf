@@ -16,7 +16,7 @@ Training code is provided for both PyTorch and TensorFlow.
 2. モーションを MMD 用の VMD に変換し（手首の向きを MediaPipe の手のひらの向きで補正し、腕・手のひら・指先が体や相手の腕を貫通しないように直す）（変換は [`nlf2vmd`](nlf2vmd/README.md)、仕様は [`vmd.md`](vmd.md)。GPU 不要のコマンドライン `python -m nlf2vmd` でも実行できます）、
 3. 動画の音声から [Demucs](https://github.com/adefossez/demucs) でボーカルを取り出し、[Allosaurus](https://github.com/xinjli/allosaurus) で母音を認識して、口のモーフ（「あ」「い」「う」「え」「お」「ん」）のキーを作り、
 4. 手首のまわりを切り出して [MediaPipe Hands](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker) で指の 21 点を求め、手の形（グー・チョキ・パー・指 1 本だけ など 9 種）を判定して指ボーンのキーを作り、
-5. VMD を **フル**（`motion_full.vmd`）/ **フル [接地優先]**（`motion_full_locked.vmd`。ジャンプ・片足上げなどによる浮きを除き、どのフレームでもどちらかの足を床に着けたもの。既定はこの 2 つ）/ **フル [移動なし]** / **上半身のみ** / **表情のみ** から選んで書き出す（フルと接地優先は、浮いていた所以外は同じ動きなので切り貼りして使える）
+5. VMD を **フル**（`motion_full.vmd`）/ **フル [接地優先]**（`motion_full_locked.vmd`。ジャンプ・片足上げなどによる浮きを除き、どのフレームでも両足を床に着けたもの。既定はこの 2 つ）/ **フル [移動なし]** / **上半身のみ** / **表情のみ** から選んで書き出す（フルと接地優先は、足が浮いていた所以外は同じ動きなので切り貼りして使える）
 
 という一連の処理を行う日本語ノートブックです。出力は VMD だけです。SMPL の体モデルは NLF の TorchScript に入っているので、
 SMPL 公式ファイルが無くても動作します。

@@ -7,8 +7,8 @@ MorphTrack）と手の形（hands.py の指ボーンの BoneTrack）はどの種
 
   full        センター・グルーブ・足ＩＫ・全身の回転（convert の結果そのまま）
   locked      フルから、ジャンプ・片足上げなどで両足が床から離れた所を除く（locked.py）。ジャンプとして残した区間は
-              体を床へ下ろしてセンターを求め直し、どのフレームでも低いほうの足を床に着け、床に下ろした足は
-              フルで着いていた位置に固定する。回転とセンターの水平移動はフルと同じで、浮いていた所から
+              体を床へ下ろしてセンターを求め直し、どのフレームでも両足（locked.both_feet: false なら低いほうの
+              足）を床に着け、床に下ろした足はフルで着いていた位置に固定する。回転とセンターの水平移動はフルと同じで、浮いていた所から
               離れたフレームはフルと同じ値になる（フルと切り貼りして使う）
   no_move     フルから体の水平移動（センターの X・Z）を除く。足ＩＫは、接地している間はその場に固定し
               （足が滑らない）、足跡を「その足が着いている間のセンターの平均位置」の分だけずらす。
@@ -165,21 +165,21 @@ def no_move_motion(result):
 
 
 def log_locked(info, fps, log):
-    hover = info['hover_frames']
+    hover, one = info['hover_frames'], info['one_foot_hover_frames']
     added = info['added_lock_frames']
     jump = (f'ジャンプとして残した {info["jump_frames"]} フレームの体を床へ下ろした量 最大 '
             f'{info["max_jump_cm"]:.1f} cm' if info['jump_frames'] else 'ジャンプとして残した区間なし')
     log(f'[接地優先] {jump} / 足ＩＫを下ろした量 最大 {info["max_foot_drop_cm"]:.1f} cm / '
-        f'床に固定した足のフレームを追加 左 {added[0]}・右 {added[1]} / 両足とも {HOVER_M * 100:.0f}cm より'
-        f'浮いたフレーム {hover["before"]} → {hover["after"]}')
+        f'床に固定した足のフレームを追加 左 {added[0]}・右 {added[1]} / {HOVER_M * 100:.0f}cm より浮いたフレーム '
+        f'両足とも {hover["before"]} → {hover["after"]}・片足でも {one["before"]} → {one["after"]}')
     if info['differ_frames']:
         log('[接地優先] フルと違うフレーム: ' + format_ranges(info['differ_frames'], fps))
     else:
         log(f'[接地優先] フルと同じ動きです（どのフレームもフルとの差が {SAME_POS_M * 1000:.0f}mm・'
             f'{SAME_ROT_DEG:g} 度以下）')
     if info['exceed_after']:
-        log(f'⚠️ [接地優先] {info["exceed_after"]} フレームで脚が伸び切っています'
-            '（center.reach_max_drop_m を大きくすると下げられます）')
+        log(f'⚠️ [接地優先] {info["exceed_after"]} フレームで脚が伸び切っています（床へ下ろした足に脚が届きません。'
+            'center.reach_max_drop_m を大きくすると下げられます）')
 
 
 def variant_tracks(result, kind, log=print):

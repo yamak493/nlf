@@ -1,4 +1,4 @@
-"""フル [接地優先]（motion_full_locked.vmd）: ジャンプ・片足上げで体ごと浮いた所も、どちらかの足を床に着けること。
+"""フル [接地優先]（motion_full_locked.vmd）: ジャンプ・片足上げで足が浮いた所も、足を床に着けること。
 浮いていない所はフルと同じ動きで、2 つの VMD を切り貼りできること。"""
 import numpy as np
 import pytest
@@ -14,8 +14,8 @@ from nlf2vmd.variants import variant_tracks
 FPS = 30.0
 
 
-def _convert(body_model, motion):
-    cfg = load_config(overrides=['diagnostics.enabled=false'])
+def _convert(body_model, motion, overrides=()):
+    cfg = load_config(overrides=['diagnostics.enabled=false', *overrides])
     return convert(motion, None, body_model=body_model, config=cfg, log=None)
 
 
@@ -24,6 +24,13 @@ def jump(body_model):
     """その場で足踏みし、5 秒から 0.45 秒・高さ 25cm のジャンプ。"""
     motion = add_jump(synthetic_walk(num_frames=300, speed=0.0, seed=0), 5.0, 0.45, 0.25)
     return motion, _convert(body_model, motion)
+
+
+@pytest.fixture(scope='module')
+def jump_one_foot(body_model):
+    """jump と同じ動きを locked.both_feet: false（片足だけの浮きは残す）で。"""
+    motion = add_jump(synthetic_walk(num_frames=300, speed=0.0, seed=0), 5.0, 0.45, 0.25)
+    return motion, _convert(body_model, motion, ['locked.both_feet=false'])
 
 
 def _tracks(tracks):
@@ -43,19 +50,42 @@ def test_jump_is_grounded_with_a_planted_foot(jump):
     planted = [f for f in range(2) if lm.contact.flags[air, f].all()]
     assert planted
     target = lm.foot_ik.target[air, planted[0]]
-    np.testing.assert_allclose(target, np.broadcast_to(target[0], target.shape), atol=1e-9)
+    np.testing.assert_allclose(target, np.broadcast_to(target[0], target.shape), atol=0.003 * k)
     # 骨盤は跳び上がらない（フルは 15cm 以上上がる）
     rise_full = r.center.delta[air, 1].max() - r.center.delta[~air, 1].max()
     rise = lm.center.delta[air, 1].max() - lm.center.delta[~air, 1].max()
     assert rise_full / k > 0.1 and rise / k < 0.01
     assert info['exceed_after'] == 0
-    (s, e), = runs(air)
+
+
+def test_both_feet_stay_on_the_floor(jump):
+    """既定（locked.both_feet）では、足踏みで上げる足も含めて、どのフレームでも両足の足裏が床に着いている。
+    回転とセンターの水平移動はフルと同じ。"""
+    motion, r = jump
+    lm = locked_motion(r)
+    info = lm.info
+    assert info['max_highest_sole_cm']['before'] > 5.0
+    assert info['one_foot_hover_frames']['after'] == 0 and info['max_highest_sole_cm']['after'] < 0.5
+    assert info['exceed_after'] == 0
+    full = _tracks(r.tracks)
+    for name, t in _tracks(variant_tracks(r, 'locked', log=None)).items():
+        if name not in ('グルーブ', '左足ＩＫ', '右足ＩＫ'):
+            np.testing.assert_array_equal(t.positions, full[name].positions)
+            np.testing.assert_array_equal(t.rotations, full[name].rotations)
+
+
+def test_one_foot_mode_changes_only_around_the_jump(jump_one_foot):
+    motion, r = jump_one_foot
+    info = locked_motion(r).info
+    assert info['hover_frames']['after'] == 0 and info['one_foot_hover_frames']['after'] > 0
+    (s, e), = runs(motion['airborne'])
     assert all(s - 15 <= a and b <= e + 15 for a, b in info['differ_frames'])
 
 
-def test_locked_can_be_spliced_with_full(jump):
-    """回転とセンターの水平移動はフルと同じ。ジャンプから離れたフレームは、グルーブ・足ＩＫもフルと同じ。"""
-    motion, r = jump
+def test_locked_can_be_spliced_with_full(jump_one_foot):
+    """回転とセンターの水平移動はフルと同じ。ジャンプから離れたフレームは、グルーブ・足ＩＫもフルと同じ
+    （locked.both_feet: false。既定では足踏みで上げる足も床に着けるので、どのフレームでも足ＩＫが変わる）。"""
+    motion, r = jump_one_foot
     k = r.scale
     full = _tracks(r.tracks)
     locked = _tracks(variant_tracks(r, 'locked', log=None))
@@ -87,7 +117,7 @@ def test_center_mode_b_keeps_the_horizontal_center_of_full(body_model):
 
 def test_raised_leg_that_looks_like_a_hop_keeps_the_support_foot_down(body_model):
     """片足を高く上げた（腿上げ）ときに、推定で体全体が 8cm 持ち上がり、フルではジャンプとして残る。
-    接地優先では、支持脚（左足）は床に着いたまま動かず、骨盤も上がらない。"""
+    接地優先では、支持脚（左足）は床に着いたまま動かず、骨盤も上がらない。上げた右足も床に着ける。"""
     motion = add_jump(synthetic_walk(num_frames=300, speed=0.0, lift=0.25, seed=0), 4.95, 0.25, 0.08)
     r = _convert(body_model, motion)
     k, air = r.scale, motion['airborne']
@@ -100,14 +130,15 @@ def test_raised_leg_that_looks_like_a_hop_keeps_the_support_foot_down(body_model
     np.testing.assert_allclose(lm.foot_ik.target[s:e + 1, 0],
                                np.broadcast_to(lm.foot_ik.target[s, 0], (e - s + 1, 3)),
                                atol=0.003 * k)
-    assert lm.info['max_lowest_sole_cm']['after'] < 0.5
+    assert lm.info['max_highest_sole_cm']['after'] < 0.5         # 上げた右足も床に着いている
     before = lm.center.delta[s - 10:s, 1].mean()
     assert (r.center.delta[air, 1].max() - before) / k > 0.015     # フルは骨盤が上がる
     assert (lm.center.delta[air, 1].max() - before) / k < 0.005
 
 
 def test_motion_without_floating_is_the_same_as_full(body_model):
-    r = _convert(body_model, synthetic_walk(num_frames=240, speed=0.0, noise_deg=1.0))
+    r = _convert(body_model, synthetic_walk(num_frames=240, speed=0.0, noise_deg=1.0),
+                 ['locked.both_feet=false'])
     lm = locked_motion(r)
     assert lm.info['differ_frames'] == [] and lm.info['added_lock_frames'] == [0, 0]
     full = _tracks(r.tracks)
