@@ -296,7 +296,7 @@ def _constrained_step(J, b, damping):
     滑って、満たせる配置に移る。
     """
     active = [int(c) for c in np.flatnonzero(b > 0.0)]
-    delta = np.zeros(3)
+    delta = np.zeros(J.shape[1])   # 変数の数は J の列の数（肩だけなら 3、ひじも曲げるなら 4）
     tol = 1e-9 * max(1.0, float(np.abs(b).max()))
     for _ in range(2 * len(b) + 2):
         if active:
