@@ -1,7 +1,7 @@
 """ステージ9b: 腕・手のひら・指先と、体・相手の腕の接触の解決（指先までの当たり判定）。
 
 ステージ9a（腕どうしの貫通の防止）は、左右の腕を上腕・前腕・手の 3 本のカプセルで表し、自重する腕を肩まわりに
-回すだけだった。手は 1 本の棒で、指の形も体（胴・頭・脚・スカート）との重なりも見ていない。ここでは
+回し、ひじを曲げ伸ばしするだけだった。手は 1 本の棒で、指の形も体（胴・頭・脚・スカート）との重なりも見ていない。ここでは
 
 * **腕の当たり判定**: 上腕・前腕・手のひら（手首 → 人指１、手首 → 小指１、人指１ → 小指１ の 3 本）・5 本の指の
   各節（付け根 → 第 2 → 第 3 → 指先）のカプセル（片腕で最大 20 本）。指の形は指ボーンのローカル回転
@@ -21,8 +21,8 @@
   （1 フレームに return_deg_per_s まで）どの組も重ならない最小の補正を、線形化した条件と減衰付きの
   アクティブセット法で求める。補正する関節は、肩（腕ボーン。3 自由度）・ひじ（ひじボーン。曲げの軸まわりの
   1 自由度）・手首（手首ボーン。3 自由度）。関節ごとの回転のコストを「係数 × (関節から先の長さ × 角度)²」にして、
-  先の関節ほど動かしやすくする（指先が胸に触れただけで腕全体が回らない）。腕どうしの組はステージ9a と同じく
-  自重する腕の肩だけで離す（ひじの曲げ・手首の向きは変えない）。補正を時間方向にならしてから、ならして浅くなった
+  先の関節ほど動かしやすくする（指先が胸に触れただけで腕全体が回らない）。腕どうしの組は
+  自重する腕の肩だけで離す（ひじの曲げ・手首の向きは変えない。大きな重なりはステージ9a で離してある）。補正を時間方向にならしてから、ならして浅くなった
   重なりをもう一度離す
 * **触れるのは正しい**: 表面どうしを margin_m まで離すだけで、それ以上は離さない（胸に手を当てる・手を合わせる動きは
   触れたまま残る）。スカート・胸の物理の剛体は、重なりの soft_ratio の割合だけ離す（残りは MMD の物理に任せる）
@@ -36,7 +36,7 @@ import numpy as np
 
 from . import filters, quat
 from .arm_collision import (OVERLAP_TOL_M, _angle, _chain, _cross, _rotation, _rotvec, arm_model,
-                            bone_positions, closest_points)
+                            bone_positions, closest_points, globals_from_local)
 from .skeleton import SIDES
 
 FINGERS = ('thumb', 'index', 'middle', 'ring', 'pinky')
@@ -383,19 +383,6 @@ def leg_globals(skel, glob_rot, smpl_rest):
                 C = quat.to_matrix(quat.from_two_vectors(skel.internal(child) - skel.internal(bone),
                                                          J[jc] - J[j]))
                 out[bone] = glob_rot[:, j] @ C
-    return out
-
-
-def globals_from_local(rt, glob_rot, local):
-    """キーを打つボーンの大域回転 {名前: (T, 3, 3)}（ローカル回転 local を親から順に掛けたもの）。"""
-    base = rt.global_matrices(glob_rot)
-    out = {}
-    for name in rt.bones:          # 親が子より先に並んでいる
-        parent = rt.keyed_parent[name]
-        R = quat.to_matrix(local[name])
-        out[name] = R if parent is None else out[parent] @ R
-    for name, G in base.items():
-        out.setdefault(name, G)
     return out
 
 

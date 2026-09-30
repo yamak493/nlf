@@ -409,9 +409,12 @@ def save_plots(r, out_dir):
                                                 a.depth_after.min(initial=0.0))) * cm))
         ax2 = ax.twinx()
         ax2.plot(frames, a.correction_deg, color='tab:purple', lw=1.2, label='correction of the '
-                 'yielding arm [deg]')
+                 'yielding arm (shoulder) [deg]')
+        if a.elbow:
+            ax2.plot(frames, a.elbow_deg, color='tab:green', lw=1.2, label='bend of the elbow [deg]')
         ax2.set_ylabel('correction [deg]')
-        ax2.set_ylim(0.0, max(10.0, 1.2 * float(a.correction_deg.max(initial=0.0))))
+        ax2.set_ylim(0.0, max(10.0, 1.2 * float(max(a.correction_deg.max(initial=0.0),
+                                                     a.elbow_deg.max(initial=0.0)))))
         before, after = a.overlap_frames(OVERLAP_TOL_M * k)
         radius = a.radius.mean(0) * cm
         yields = {0: 'left arm yields', 1: 'right arm yields'}.get(a.side, 'no correction')
@@ -419,7 +422,7 @@ def save_plots(r, out_dir):
                      f'radius upper / fore / hand '
                      f'{radius[0]:.1f} / {radius[1]:.1f} / {radius[2]:.1f} cm ({a.radius_source})',
                      fontsize=10)
-        lines = ax.get_lines()[:2] + ax2.get_lines()[:1]
+        lines = ax.get_lines()[:2] + ax2.get_lines()
         ax.legend(lines, [ln.get_label() for ln in lines], loc='upper right', fontsize=8)
         ax3.plot(frames, a.shift_image * cm, color='tab:blue', lw=1.2, label='image plane')
         ax3.plot(frames, a.shift_depth * cm, color='tab:orange', lw=1.2, label='depth (camera axis)')
