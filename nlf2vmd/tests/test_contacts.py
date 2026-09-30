@@ -9,7 +9,8 @@ import numpy as np
 import pytest
 
 from nlf2vmd import convert, load_config, quat
-from nlf2vmd.contacts import (FINGERS, PARTS, _rigid_rotation, arm_capsules, body_capsules)
+from nlf2vmd.contacts import (BODY_PARTS, FINGERS, PARTS, _fallback_capsules, _rigid_rotation,
+                              arm_capsules, body_capsules)
 from nlf2vmd.hands import build_rig, preset_angles, SHAPES
 from nlf2vmd.pipeline import apply_hand_poses
 from nlf2vmd.pmx import read_pmx
@@ -110,6 +111,75 @@ def test_read_rigid_bodies_and_body_capsules(tmp_path):
     assert abs(waist.radius - (1.2 + cfg.cloth_margin_m * 10.0)) < 1e-6
     no_skirt = load_config(overrides=['contacts.skirt=none']).contacts
     assert 'スカート' not in [c.name for c in body_capsules(skel, no_skirt, 10.0)[0]]
+
+
+def test_body_parts_of_rigid_bodies(tmp_path):
+    """剛体を 服・装飾 / 頭部 / 胴部 / 胸 / 脚 に分ける（設定 contacts.body_parts で部位ごとに判定を切り替える）。"""
+    bones = hand_bones()
+    names = [b[0] for b in bones]
+    extra = []
+
+    def add(name, pos, parent):
+        extra.append((name, pos, (names + [e[0] for e in extra]).index(parent), None, False))
+
+    add('胸親', (0.0, 14.0, -0.2), '上半身2')
+    add('左胸', (0.6, 14.0, -0.4), '胸親')
+    add('ネクタイ', (0.0, 14.5, -0.5), '上半身2')
+    add('スカート', (0.0, 10.5, -0.5), '下半身')
+    add('髪根元', (0.0, 17.8, 0.3), '頭')
+    add('左足D', (0.95, 10.9, 0.2), '下半身')
+    add('左ひざD', (0.95, 6.1, -0.1), '左足D')
+    z = (0.0, 0.0, 0.0)
+
+    def rigids(idx):
+        def sphere(name, bone, pos, mode=0):
+            return (name, idx(bone), 0, (0.4, 0.0, 0.0), pos, z, mode)
+        return [sphere('胸', '上半身2', (0.0, 14.0, 0.3)),               # 胸板（胴部）
+                sphere('上半身', '上半身', (0.0, 12.3, 0.2)),
+                sphere('下半身', '下半身', (0.0, 10.8, 0.2)),
+                sphere('右胸', '上半身2', (-0.6, 14.0, -0.6)),           # 胸のボーンの無いモデルの胸
+                sphere('スカート前', '下半身', (0.0, 10.3, -0.8)),        # 下半身に付いたスカートの根元
+                sphere('左胸揺れ', '左胸', (0.6, 14.0, -0.6), mode=1),
+                sphere('胸親', '胸親', (0.0, 14.0, -0.3)),
+                sphere('ネクタイ', 'ネクタイ', (0.0, 14.0, -0.6), mode=1),
+                sphere('スカート後', 'スカート', (0.0, 10.3, 0.8), mode=1),
+                sphere('スカート根元', 'スカート', (0.0, 10.6, 0.8)),
+                sphere('頭', '頭', (0.0, 17.5, 0.2)),
+                sphere('首', '首', (0.0, 16.4, 0.3)),
+                sphere('髪根元', '髪根元', (0.0, 17.8, 0.5)),
+                sphere('左太もも', '左足', (0.95, 8.5, 0.1)),
+                sphere('右すね', '右ひざ', (-0.95, 3.5, 0.1)),
+                sphere('左太ももD', '左足D', (0.95, 8.5, 0.1)),
+                sphere('左すねD', '左ひざD', (0.95, 3.5, 0.1))]
+
+    skel = Skeleton.from_pmx(read_pmx(hand_pmx(tmp_path, rigids, extra_bones=extra)))
+    caps, source = body_capsules(skel, load_config().contacts, 10.0)
+    assert source == 'rigid'
+    got = {c.name: c.body_part for c in caps}
+    assert got == {'胸': 'torso', '上半身': 'torso', '下半身': 'torso', '右胸': 'chest',
+                   'スカート前': 'clothes', '左胸揺れ': 'chest', '胸親': 'chest', 'ネクタイ': 'clothes',
+                   'スカート後': 'clothes', 'スカート根元': 'clothes', '頭': 'head', '首': 'head',
+                   '髪根元': 'head', '左太もも': 'legs', '右すね': 'legs', '左太ももD': 'legs',
+                   '左すねD': 'legs'}
+
+
+def test_body_parts_of_mesh_and_standard_shapes(tmp_path):
+    bones = hand_bones()
+    names = [b[0] for b in bones]
+    rng = np.random.default_rng(0)
+    verts = []
+    for bone, center, half in (('上半身2', (0.0, 14.0, 0.3), (1.5, 1.4, 0.9)),
+                               ('頭', (0.0, 17.6, 0.2), (0.9, 1.0, 0.9)),
+                               ('左足', (0.95, 8.5, 0.1), (0.6, 2.0, 0.6))):
+        for p in rng.uniform(-1, 1, (80, 3)) * half + center:
+            verts.append((tuple(p), 0, (names.index(bone),), ()))
+    skel = Skeleton.from_pmx(read_pmx(hand_pmx(tmp_path, vertices=verts)))
+    cfg = load_config().contacts
+    caps, source = body_capsules(skel, cfg, 10.0)
+    assert source == 'mesh'
+    assert {c.bone: c.body_part for c in caps} == {'上半身2': 'torso', '頭': 'head', '左足': 'legs'}
+    std = {c.name: c.body_part for c in _fallback_capsules(Skeleton.standard(), 10.0, cfg)}
+    assert std == {'胴': 'torso', '腰': 'torso', '頭': 'head', '左太もも': 'legs', '右太もも': 'legs'}
 
 
 def test_rigid_rotation_order_is_z_x_y():
@@ -277,6 +347,69 @@ def test_disabled_keeps_the_rotations(tmp_path, body_model):
     r = _convert(body_model, _press(), pmx, ['contacts.enabled=false'])
     assert not r.contacts.enabled
     np.testing.assert_allclose(r.local_quats['左手首'], r.local_before_contacts['左手首'])
+
+
+def _parts_off(*parts):
+    return [f'contacts.body_parts.{p}=false' for p in parts]
+
+
+def test_unchecked_body_part_is_not_resolved(tmp_path, body_model):
+    """判定しない部位（胴部）に入った前腕は直さない。関係の無い部位（頭部）を外しても結果は変わらない。"""
+    pmx = hand_pmx(tmp_path)
+    motion = _press(elbow=(0.2, -0.8, 0.55), hand=(-0.05, 0.08, 0.08))
+    full = _convert(body_model, motion, pmx)
+    assert full.contacts.correction_deg[:, 0].max() > 2.0
+    no_torso = _convert(body_model, motion, pmx, _parts_off('torso'))
+    assert no_torso.contacts.num_body < full.contacts.num_body
+    assert no_torso.contacts.correction_deg.max() < 1e-6
+    for name in ('左腕', '左ひじ', '左手首'):
+        np.testing.assert_allclose(no_torso.local_quats[name], no_torso.local_before_contacts[name])
+    info = no_torso.info['contacts']['body_parts']
+    assert not info['torso']['enabled'] and info['head']['enabled']
+    assert info['torso']['capsules'] > 0                     # 判定しない部位も数は記録する
+    no_head = _convert(body_model, motion, pmx, _parts_off('head', 'clothes', 'chest'))
+    for name in ('左腕', '左ひじ', '左手首'):
+        np.testing.assert_allclose(no_head.local_quats[name], full.local_quats[name])
+
+
+def test_all_parts_unchecked_skips_the_stage(tmp_path, body_model):
+    """体の部位をすべて外し、腕どうしも判定しない（arm_collision.mode: none）なら、ステージ9b は何もしない。"""
+    lines = []
+    cfg = load_config(overrides=['diagnostics.enabled=false', *ONLY_9B, 'arm_collision.mode=none',
+                                 *_parts_off(*BODY_PARTS)])
+    r = convert(_press(), None, pmx=hand_pmx(tmp_path), body_model=body_model, config=cfg,
+                log=lines.append)
+    assert not r.contacts.enabled and r.contacts.num_body == 0
+    for name in ('左腕', '左ひじ', '左手首'):
+        np.testing.assert_allclose(r.local_quats[name], r.local_before_contacts[name])
+    assert any('[9b]' in s and '判定する部位がありません' in s for s in lines)
+
+
+def test_arm_pairs_without_body_parts(body_model):
+    """体の部位をすべて外しても、腕どうし（指先まで）は自重する腕の肩で離す。"""
+    motion = add_arm_cross(synthetic_walk(num_frames=30))
+    r = _convert(body_model, motion, None, ['arm_collision.mode=left', *_parts_off(*BODY_PARTS)])
+    assert r.contacts.enabled and r.contacts.num_body == 0
+    assert r.info['contacts']['pairs']['body'] == 0 and r.info['contacts']['pairs']['arm'] > 0
+    assert r.contacts.overlap_frames(0.005 * r.scale)[1] == 0
+
+
+def test_log_shows_the_checked_parts(tmp_path, body_model):
+    lines = []
+    cfg = load_config(overrides=['diagnostics.enabled=false', *ONLY_9B, 'arm_collision.mode=right',
+                                 *_parts_off('clothes', 'chest')])
+    convert(_press(), None, pmx=hand_pmx(tmp_path), body_model=body_model, config=cfg,
+            log=lines.append)
+    line = next(s for s in lines if s.startswith('[9b]'))
+    assert '判定する相手: 腕（右腕の動きを自重する）・頭部・胴部・脚' in line
+    assert '判定しない部位: 服・装飾・胸' in line
+
+
+@pytest.mark.parametrize('item,error', [('contacts.body_parts.head=maybe', ValueError),
+                                        ('contacts.body_parts.hair=false', KeyError)])
+def test_invalid_body_parts(tmp_path, body_model, item, error):
+    with pytest.raises(error):
+        _convert(body_model, _press(), hand_pmx(tmp_path), [item])
 
 
 def test_invalid_body_source(tmp_path, body_model):

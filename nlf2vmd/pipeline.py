@@ -14,7 +14,7 @@ from .body_model import ANKLES, BodyModel, compute_kinematics, forward_kinematic
 from .center import ReachGeometry, stabilize_center
 from .config import Config, load_config
 from .contact import detect_contacts
-from .contacts import resolve_contacts
+from .contacts import BODY_PART_LABELS, resolve_contacts
 from .depth import depth_axis, depth_jitter, detection_speeds, reconstruct_depth
 from .floor import estimate_floor
 from .filters import runs
@@ -207,20 +207,34 @@ def log_outliers(outliers, fps, log, warn):
              '決められないので置き換えていません')
 
 
+def _contact_targets(info):
+    """ステージ9b で当たり判定をする相手（腕・体の部位）と、判定しない体の部位の文字列。"""
+    parts = info.get('body_parts', {})
+    on = [BODY_PART_LABELS[p] for p, v in parts.items() if v['enabled']]
+    off = [BODY_PART_LABELS[p] for p, v in parts.items() if not v['enabled']]
+    arm = info.get('arm_mode', 'none')
+    if arm in ('left', 'right'):
+        on.insert(0, f'腕（{MODE_LABELS[arm]}）')
+    return '・'.join(on) or 'なし', '・'.join(off)
+
+
 def log_contacts(contacts, unit, log, label='[9b]'):
     if log is None:
         return
+    on, off = _contact_targets(contacts.info)
     if not contacts.enabled:
-        log(f'{label} 腕・指と体の接触: 扱いません')
+        log(f'{label} 腕・指と体の接触: 扱いません'
+            + ('（判定する部位がありません）' if contacts.info and on == 'なし' else ''))
         return
+    skipped = f'（判定しない部位: {off}）' if off else ''
     info = contacts.info
     source = dict(rigid='PMX の剛体', mesh='PMX のメッシュ', config='標準の体格', none='なし')[
         info['body_source']]
     parts = ' / '.join(f'{k} {b}→{a}' for k, (b, a) in info['overlap_frames_by_part'].items()
                        if b or a)
     corr = info['max_correction_deg']
-    log(f'{label} 腕・指と体・相手の腕の接触（体の形: {source} {info["body_capsules"]} 個・'
-        f'{"指の各節まで" if info["fingers"] else "手は 1 本の棒"}）: 重なり '
+    log(f'{label} 腕・指と体・相手の腕の接触（判定する相手: {on}{skipped} / 体の形: {source} '
+        f'{info["body_capsules"]} 個・{"指の各節まで" if info["fingers"] else "手は 1 本の棒"}）: 重なり '
         f'{info["overlap_frames"]["before"]} → {info["overlap_frames"]["after"]} フレーム'
         + (f'（{parts}）' if parts else '')
         + f' / 補正 最大 肩 {corr["shoulder"]:.1f}・ひじ {corr["elbow"]:.1f}・手首 {corr["wrist"]:.1f} 度')
