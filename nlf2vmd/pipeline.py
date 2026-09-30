@@ -27,7 +27,8 @@ from .contacts import BODY_PART_LABELS, resolve_contacts
 from .depth import depth_axis, depth_jitter, detection_speeds, reconstruct_depth
 from .floor import estimate_floor
 from .filters import frames_for_fps, runs
-from .foot_ik import boundary_steps, build_foot_ik
+from .foot_ik import (HEEL, TOE, boundary_steps, build_foot_ik, mmd_sole_points,
+                      sole_floor_levels)
 from .ground import floating_frames, ground_offset
 from .hand_reach import keep_hand_positions
 from .jitter import remove_rotation_outliers, stabilize_pose, stabilize_root
@@ -620,10 +621,15 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     rt = Retargeter(skel, rest.joints, foot_axes, cfg.retarget)
     for w in rt.warnings:
         warn(w)
+    # つま先だけ・かかとだけが床に着いている所は、モデルの足の形のその点を固定する（foot_ik.pivot）
     ik = build_foot_ik(kin.joints[:, ANKLES], ankle_rest, rt.foot_ik_quats(kin.glob_rot),
-                       contact, fps, k, cfg.foot_ik)
+                       contact, fps, k, cfg.foot_ik, sole_points=mmd_sole_points(skel),
+                       sole_floor=sole_floor_levels(skel, ankle_rest))
     steps = boundary_steps(ik.target, contact)
     max_step = float(cfg.foot_ik.max_boundary_step_m) * k
+    pivot_frames = [int(np.isin(ik.phase[:, f], (TOE, HEEL)).sum()) for f in range(2)]
+    log(f'[7] 足ＩＫ: 接地中につま先だけ・かかとだけを固定して足を回したフレーム 左 {pivot_frames[0]}・'
+        f'右 {pivot_frames[1]}（ほかの接地中は足裏全体を固定）')
     if max(steps) > max_step:
         warn(f'接地区間の境界で足ＩＫが 1 フレームに {max(steps) / k * 100:.1f} cm 動いています')
 
@@ -723,7 +729,9 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
                    segment_heights=floor.segment_heights),
         foot_ik=dict(clamped_frames=ik.clamped_frames,
                      max_boundary_step_cm=[s / k * 100.0 for s in steps],
-                     max_boundary_step_limit_cm=float(cfg.foot_ik.max_boundary_step_m) * 100),
+                     max_boundary_step_limit_cm=float(cfg.foot_ik.max_boundary_step_m) * 100,
+                     pivot_frames=dict(toe=[int((ik.phase[:, f] == TOE).sum()) for f in range(2)],
+                                       heel=[int((ik.phase[:, f] == HEEL).sum()) for f in range(2)])),
         center=dict(mode=center.mode, exceed_before=center.exceed_before,
                     exceed_after=center.exceed_after,
                     max_drop_cm=float(-center.correction.min() / k * 100.0)),

@@ -10,7 +10,8 @@ from .ground import floating_frames, lowest_foot_height
 from .jitter import JOINT_GROUPS, angular_acceleration
 
 METRIC_LABELS = {
-    'foot_slide_cm_per_frame': ('足滑り', '接地区間内の足ＩＫの水平移動量の平均', '0'),
+    'foot_slide_cm_per_frame': ('足滑り', '接地区間内で床に固定している点（足裏全体が着いていれば足ＩＫ、つま先だけ・かかとだけ'
+                                'が着いていればその点。処理前は足首）の水平移動量の平均', '0'),
     'penetration_frames': ('埋まり', '足ＩＫの差分Yが0未満のフレーム数（足ごと）', '0'),
     'floating_frames': ('浮き', '両足の最下点が接地終了の高さより上にいる状態が、ジャンプの最長滞空時間'
                         '（ground.max_flight_sec）より長く続くフレーム数', '0'),
@@ -75,17 +76,22 @@ def foot_motion_near_floor(pos, heights, limit, unit):
 def output_sole_heights(r, foot_ik=None, contact=None):
     """(T, 2) 出力の足ＩＫでの足裏の高さ（足首の高さ − その姿勢での足首から足裏の最下点までの高さ）。
 
-    接地区間は、足ＩＫの回転を区間内の平均で固定しているので、足首から足裏までの高さも区間内の中央値を使う。
+    接地区間のうち足裏全体が着いている所は、足ＩＫの回転をその部分の平均で固定しているので、足首から足裏までの高さも
+    その部分の中央値を使う（つま先だけ・かかとだけが着いている所は、回転が推定のままなのでフレームごとの値）。
     foot_ik / contact を渡すと、r の代わりにその足ＩＫ・接地区間で求める（フル [接地優先] の出力を調べる）。
     """
+    from .foot_ik import FLAT
     foot_ik = r.foot_ik if foot_ik is None else foot_ik
     contact = r.contact if contact is None else contact
     ankle_above_sole = r.kin.joints[:, ANKLES, 1] - r.kin.contact_points[..., 1].min(-1)
     sole = foot_ik.target[..., 1] - ankle_above_sole
-    for foot in range(2):
-        for s, e in contact.segments[foot]:
-            sole[s:e + 1, foot] = foot_ik.target[s:e + 1, foot, 1] - np.median(
-                ankle_above_sole[s:e + 1, foot])
+    phase = getattr(foot_ik, 'phase', None)
+    for foot, segs in enumerate(foot_ik.planted_segments(contact.segments) if phase is not None
+                                else contact.segments):
+        for s, e in segs:
+            if phase is None or phase[s, foot] == FLAT:
+                sole[s:e + 1, foot] = foot_ik.target[s:e + 1, foot, 1] - np.median(
+                    ankle_above_sole[s:e + 1, foot])
     return sole
 
 
@@ -122,7 +128,8 @@ def compute_metrics(r):
     raw_ik_delta = raw_ankles - r.ankle_rest[None]
     m = {
         'foot_slide_cm_per_frame': dict(before=foot_slide(raw_ankles, seg, k),
-                                        after=foot_slide(r.foot_ik.target, seg, k)),
+                                        after=foot_slide(r.foot_ik.pinned_points(),
+                                                         r.foot_ik.planted_segments(seg), k)),
         'penetration_frames': dict(before=(raw_ik_delta[..., 1] < 0).sum(0).tolist(),
                                    after=(r.foot_ik.delta[..., 1] < 0).sum(0).tolist()),
         'floating_frames': dict(before=floating_frames(lowest_foot_height(r.kin_raw), r.fps, float_h,

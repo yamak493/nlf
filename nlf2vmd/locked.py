@@ -40,7 +40,7 @@ from . import filters, quat
 from .body_model import ANKLES
 from .center import apply_reach_clamp, stabilize_center
 from .contact import ContactResult, clean_flags, hysteresis
-from .foot_ik import build_foot_ik
+from .foot_ik import build_foot_ik, mmd_sole_points, sole_floor_levels
 from .ground import support_height
 from .skeleton import SIDES
 
@@ -67,21 +67,6 @@ def jump_height(result):
         return np.zeros(T)
     height = support_height(result.kin, result.contact)
     return np.where(np.asarray(flight, bool), np.maximum(height, 0.0), 0.0)
-
-
-def mmd_sole_points(skel):
-    """(2, 2, 3) 左右の足の、足ＩＫの初期位置から見た かかと・つま先 の床の点（内部座標）。
-
-    かかとは足首（足ＩＫ）の真下、つま先はつま先ＩＫ（無ければつま先）の真下の床（y = 0）。
-    """
-    out = np.zeros((2, 2, 3))
-    for side, s in enumerate(SIDES):
-        ik = skel.internal(s + '足ＩＫ')
-        toe = next((skel.internal(s + n) for n in ('つま先ＩＫ', 'つま先') if skel.has(s + n)),
-                   ik + np.array([0.0, 0.0, 0.13 * skel.leg_length(side)]))
-        out[side, 0] = [0.0, -ik[1], 0.0]
-        out[side, 1] = [toe[0] - ik[0], -ik[1], toe[2] - ik[2]]
-    return out
 
 
 def mmd_sole_heights(skel, ik):
@@ -195,9 +180,11 @@ def locked_motion(result):
                                    np.asarray(contact.heights) - foot_drop[..., None],
                                    contact.speeds)
     rt = result.retargeter
+    # フルと同じく、つま先だけ・かかとだけが床に着いている所はその点を固定する（フルの接地区間では同じ値になる）
     ik = build_foot_ik(ik_full.raw - down, result.ankle_rest, rt.foot_ik_quats(kin.glob_rot),
                        locked_contact, fps, k, cfg.foot_ik, swing=ik_full.swing - down,
-                       anchor=contact.flags)
+                       anchor=contact.flags, sole_points=mmd_sole_points(result.skeleton),
+                       sole_floor=sole_floor_levels(result.skeleton, result.ankle_rest))
     ik = ground_feet(result.skeleton, ik, bool(cfg.locked.both_feet))
 
     # 5. 体を下ろしてセンターを求め直す（ジャンプの高さはステージ8の平滑化の前に除く）。水平はフルと同じにして
