@@ -535,14 +535,20 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     log_hand_reach(reach, log)
 
     # ---- 9a. 腕どうしの貫通の防止 ----
-    local, arms = resolve_arm_collisions(skel, rt, kin.glob_rot, local, cfg.arm_collision, k, fps)
+    local, arms = resolve_arm_collisions(skel, rt, kin.glob_rot, local, cfg.arm_collision, k, fps, axis)
     n_before, n_after = arms.overlap_frames(OVERLAP_TOL_M * k)
     radius_cm = ' / '.join(f'{n} {r:.1f}' for n, r in zip(('上腕', '前腕', '手'),
                                                          arms.radius.mean(0) / k * 100.0))
     log(f'[9a] 腕どうしの貫通の防止（{MODE_LABELS[arms.mode]}）: 腕の半径 {radius_cm} cm'
         f'（{"PMX のメッシュから" if arms.radius_source == "mesh" else "設定の値"}）/ '
         f'重なり {n_before} → {n_after} フレーム'
-        + (f' / 補正 最大 {arms.correction_deg.max(initial=0.0):.1f} 度' if arms.side >= 0 else ''))
+        + (f' / 補正 最大 肩 {arms.correction_deg.max(initial=0.0):.1f}'
+           + (f'・ひじ {arms.elbow_deg.max(initial=0.0):.1f}' if arms.elbow else '（ひじは曲げない）')
+           + f' 度（腕の移動 最大 画像面内 '
+           f'{arms.shift_image.max(initial=0.0) / k * 100:.1f} cm・奥行き '
+           f'{arms.shift_depth.max(initial=0.0) / k * 100:.1f} cm。depth_cost {arms.depth_cost:g}'
+           + (f'。上限に達して奥行きの優先を弱めたフレーム {arms.relaxed_frames}' if arms.relaxed_frames else '')
+           + '）' if arms.side >= 0 else ''))
 
     # ---- 9b. 腕・手のひら・指先と、体・相手の腕の接触 ----
     # 手首は先に可動域に収めてから解く（9c。人の関節では届かない向きの手で当たり判定をしない）
@@ -630,7 +636,11 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
                            max_depth_cm={key: float(d.max(initial=0.0) / k * 100.0) for key, d in
                                          (('before', arms.depth_before),
                                           ('after', arms.depth_after))},
-                           max_correction_deg=float(arms.correction_deg.max(initial=0.0))),
+                           max_correction_deg=float(arms.correction_deg.max(initial=0.0)),
+                           elbow=arms.elbow, max_elbow_deg=float(arms.elbow_deg.max(initial=0.0)),
+                           depth_cost=arms.depth_cost, relaxed_frames=arms.relaxed_frames,
+                           max_shift_cm={key: float(d.max(initial=0.0) / k * 100.0) for key, d in
+                                         (('image', arms.shift_image), ('depth', arms.shift_depth))}),
         warnings=warns)
 
     if cfg.diagnostics.enabled:
