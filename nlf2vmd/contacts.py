@@ -26,13 +26,16 @@
   重なりをもう一度離す
 * **触れるのは正しい**: 表面どうしを margin_m まで離すだけで、それ以上は離さない（胸に手を当てる・手を合わせる動きは
   触れたまま残る）。スカート・胸の物理の剛体は、重なりの soft_ratio の割合だけ離す（残りは MMD の物理に任せる）
+* **判定する部位**（body_parts）: 体のカプセルを 服・装飾 / 頭部 / 胴部 / 胸 / 脚 のどれかに分け、false にした部位の
+  カプセルは組に入れない（その部位とは当たり判定をしない）。体の形そのもの（body_capsules）は変えないので、
+  ステージ9h（胴の寸法）には効かない
 """
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from . import filters, quat
-from .arm_collision import (OVERLAP_TOL_M, _angle, _cross, _rotation, _rotvec, arm_model,
+from .arm_collision import (OVERLAP_TOL_M, _angle, _chain, _cross, _rotation, _rotvec, arm_model,
                             bone_positions, closest_points)
 from .skeleton import SIDES
 
@@ -41,6 +44,14 @@ PARTS = ('upper', 'fore', 'palm') + FINGERS
 PART_LABELS = dict(upper='上腕', fore='前腕', palm='手のひら', thumb='親指', index='人差し指',
                    middle='中指', ring='薬指', pinky='小指')
 BODY_BONES = ('下半身', '上半身', '上半身2', '首', '頭', '左足', '右足', '左ひざ', '右ひざ')
+# 体のカプセルの部位（設定 contacts.body_parts のキー）
+BODY_PARTS = ('clothes', 'head', 'torso', 'chest', 'legs')
+BODY_PART_LABELS = dict(clothes='服・装飾', head='頭部', torso='胴部', chest='胸', legs='脚')
+# 胸（おっぱい）のボーン・剛体の名前に含まれる語（小文字で比べる。胸 だけは胴の骨格のボーンに付いた剛体の名前には使わない）
+CHEST_WORDS = ('胸', '乳', 'おっぱい', 'オッパイ', 'ｵｯﾊﾟｲ', 'bust', 'breast', 'oppai')
+# 胴の骨格のボーンに付いていても服・装飾とみなす剛体の名前の語（スカートの根元の剛体を下半身に付けたモデルなど）
+CLOTH_WORDS = ('スカート', 'ｽｶｰﾄ', 'skirt', 'ネクタイ', 'ﾈｸﾀｲ', 'リボン', 'ﾘﾎﾞﾝ', 'ribbon', 'フリル', 'ﾌﾘﾙ',
+               'frill', '裾')
 ITERATIONS = 30
 FINAL_ITERATIONS = 10
 MAX_STEP_DEG = 20.0
@@ -70,6 +81,7 @@ class Capsule:
     level: int = -1        # 腕: 0 = 上腕（肩の補正で動く）/ 1 = 前腕（＋ひじ）/ 2 = 手（＋手首）。体: -1
     weight: float = 1.0    # 体: 離す割合（物理の剛体は soft_ratio）
     name: str = ''
+    body_part: str = ''    # 体: BODY_PARTS のどれか / 腕: ''
 
 
 # ---- 腕の当たり判定 ----
@@ -191,10 +203,75 @@ def _arm_bone(skel, name):
     return any(skel.is_descendant(name, s + '肩') or skel.is_descendant(name, s + '腕') for s in SIDES)
 
 
+# ---- 体の部位（設定 contacts.body_parts） ----
+def _spine_bones(skel):
+    """胴の骨格のボーン: 上半身・下半身から 首・肩・腕・足 へ至る鎖の上のボーン（首・肩・腕・足そのものは除く）。
+    上半身・上半身2・下半身のほか、モデルによって 上半身3・首根元・腰キャンセル などが入る。"""
+    out = {n for n in ('上半身', '下半身') if skel.has(n)}
+    for end in ['首'] + [s + b for s in SIDES for b in ('肩', '腕', '足')]:
+        if skel.has(end):
+            out.update(n for n in _chain(skel, end)[:-1]
+                       if skel.is_descendant(n, '上半身') or skel.is_descendant(n, '下半身'))
+    return out
+
+
+def _has_word(name, words):
+    name = (name or '').lower()
+    return any(w in name for w in words)
+
+
+def _chest_rigid_name(name):
+    """胴の骨格のボーンに付いた剛体の名前が胸（おっぱい）のものか: 乳・おっぱい などを含むか、左右の付いた 胸
+    （左胸・胸R など）。「胸」だけの剛体は胸板（胴部）とみなす。"""
+    name = name or ''
+    return _has_word(name, CHEST_WORDS[1:]) or ('胸' in name and any(c in name for c in '左右LR'))
+
+
+def _body_part(skel, bone, spine, physics=False, name=''):
+    """体のカプセルの部位（BODY_PARTS のどれか）。
+
+    bone: カプセルが付いているボーン / spine: _spine_bones の結果 / physics: 物理演算の剛体か /
+    name: 剛体の名前（胴の骨格のボーンに付いた剛体を、名前で胸・服・装飾に分けるのに使う）。
+    * 頭部: 首とその子孫（頭・髪の根元・帽子など、頭と一緒に動く物）
+    * 脚: 足（足D）とその子孫（ひざ・足首も含む）
+    * 胸: 胴の骨格のボーンまでさかのぼる間に、名前に 胸・乳・おっぱい などを含むボーンがある（左胸・胸親 など）
+    * 胴部: 胴の骨格のボーン（上半身・上半身2・下半身など）に付いたボーン追従の剛体・形
+    * 服・装飾: それ以外（スカート・ネクタイ・リボンなど、胴の骨格以外のボーンに付いた剛体と、胸以外の物理の剛体）
+    """
+    if skel.is_descendant(bone, '首'):
+        return 'head'
+    if any(skel.is_descendant(bone, s + b) for s in SIDES for b in ('足', '足D')):
+        return 'legs'
+    n, seen = bone, set()
+    while n is not None and n not in spine and n not in seen:
+        if _has_word(n, CHEST_WORDS):
+            return 'chest'
+        seen.add(n)
+        n = skel.parents.get(n)
+    if bone in spine:
+        if _chest_rigid_name(name):
+            return 'chest'
+        if not physics and not _has_word(name, CLOTH_WORDS):
+            return 'torso'
+    return 'clothes'
+
+
+def enabled_body_parts(cfg):
+    """設定 contacts の body_parts → 当たり判定をする部位の集合（書かれていない部位は判定する）。"""
+    parts = cfg.get('body_parts') or {}
+    for key, value in parts.items():
+        if key not in BODY_PARTS:
+            raise ValueError(f'contacts.body_parts の部位は {" / ".join(BODY_PARTS)} のいずれかです: {key}')
+        if not isinstance(value, bool):
+            raise ValueError(f'contacts.body_parts.{key} は true / false で指定してください: {value}')
+    return {p for p in BODY_PARTS if parts.get(p, True)}
+
+
 def _rigid_capsules(skel, cfg, unit):
     caps = []
     margin = float(cfg.cloth_margin_m) * unit
     soft = float(cfg.soft_ratio)
+    spine = _spine_bones(skel)
     for rb in skel.rigid_bodies or []:
         bone = rb['bone']
         if bone is None or not skel.has(bone) or _arm_bone(skel, bone):
@@ -215,13 +292,17 @@ def _rigid_capsules(skel, cfg, unit):
         R = _rigid_rotation(rb['rotation'])
         size = np.asarray(rb['size'], np.float64)
         if rb['shape'] == 0:
-            caps.append(Capsule(center, center, size[0] + margin, bone, weight=weight, name=rb['name']))
+            new = [Capsule(center, center, size[0] + margin, bone, weight=weight, name=rb['name'])]
         elif rb['shape'] == 2:
             h = 0.5 * size[1]
-            caps.append(Capsule(center - h * R[:, 1], center + h * R[:, 1], size[0] + margin, bone,
-                                weight=weight, name=rb['name']))
+            new = [Capsule(center - h * R[:, 1], center + h * R[:, 1], size[0] + margin, bone,
+                           weight=weight, name=rb['name'])]
         else:
-            caps += _box_capsules(center, R, size + margin, bone, weight, rb['name'])
+            new = _box_capsules(center, R, size + margin, bone, weight, rb['name'])
+        part = _body_part(skel, bone, spine, rb['mode'] != 0, rb['name'])
+        for c in new:
+            c.body_part = part
+        caps += new
     return caps
 
 
@@ -243,7 +324,12 @@ def _mesh_capsules(skel, cfg, unit):
         c = pts.mean(0)
         _, vecs = np.linalg.eigh(np.cov((pts - c).T))
         half = np.percentile(np.abs((pts - c) @ vecs), 95.0, axis=0)
-        caps += _box_capsules(c, vecs, np.maximum(half, 1e-6), bone, 1.0, bone)
+        new = _box_capsules(c, vecs, np.maximum(half, 1e-6), bone, 1.0, bone)
+        # 胸・服の頂点も、それぞれ胴のボーン（上半身2・下半身）の箱に含まれる
+        part = 'head' if bone in ('首', '頭') else 'legs' if bone[1:] in ('足', 'ひざ') else 'torso'
+        for cap in new:
+            cap.body_part = part
+        caps += new
     return caps
 
 
@@ -254,14 +340,15 @@ def _fallback_capsules(skel, unit, cfg):
     hip = 0.5 * float(np.linalg.norm(S('左足') - S('右足')))
     chest = '上半身2' if skel.has('上半身2') else '上半身'
     lateral = np.array([0.15 * shoulder, 0.0, 0.0])
-    caps = [Capsule(S('上半身') + d, S('首') + d, 0.24 * shoulder + margin, chest, name='胴')
-            for d in (lateral, -lateral)]
-    caps.append(Capsule(S('左足'), S('右足'), 0.9 * hip + margin, '下半身', name='腰'))
+    caps = [Capsule(S('上半身') + d, S('首') + d, 0.24 * shoulder + margin, chest, name='胴',
+                    body_part='torso') for d in (lateral, -lateral)]
+    caps.append(Capsule(S('左足'), S('右足'), 0.9 * hip + margin, '下半身', name='腰', body_part='torso'))
     head = S('頭') + [0.0, 0.25 * shoulder, 0.0]
-    caps.append(Capsule(head, head, 0.33 * shoulder + margin, '頭', name='頭'))
+    caps.append(Capsule(head, head, 0.33 * shoulder + margin, '頭', name='頭', body_part='head'))
     for s in SIDES:
         if skel.has(s + 'ひざ'):
-            caps.append(Capsule(S(s + '足'), S(s + 'ひざ'), 0.8 * hip + margin, s + '足', name=s + '太もも'))
+            caps.append(Capsule(S(s + '足'), S(s + 'ひざ'), 0.8 * hip + margin, s + '足', name=s + '太もも',
+                                body_part='legs'))
     return caps
 
 
@@ -611,6 +698,12 @@ def _raw_penetration(arm_ends, body_ends, pairs):
     return pairs.R - np.linalg.norm(cp - cq, axis=-1)
 
 
+def _body_parts_info(enabled, bodies):
+    """診断出力用: 部位ごとの {判定するか, 体のカプセルの数（判定しない部位も数える）}。"""
+    return {p: dict(enabled=p in enabled, capsules=sum(b.body_part == p for b in bodies))
+            for p in BODY_PARTS}
+
+
 def _is_identity(states):
     # _angle は arccos なので 1e-8 rad 程度より小さい角を区別できない（丸め誤差で単位回転に戻りきらない）
     return all(_angle(st[0]) < IDENTITY_RAD and abs(st[1]) < IDENTITY_RAD
@@ -629,11 +722,16 @@ def resolve_contacts(skel, rt, glob_rot, local, cfg, arm_cfg, finger_bones, yiel
     T = len(glob_rot)
     caps = [arm_capsules(skel, s, cfg, arm_cfg, finger_bones, unit) for s in range(2)]
     fingers = any(c.part >= 3 for c in caps[0] + caps[1])
-    bodies, source = body_capsules(skel, cfg, unit)
+    all_bodies, source = body_capsules(skel, cfg, unit)
+    # 判定しない部位の体のカプセルは組に入れない（部位の分からないカプセルは判定する）
+    body_parts = enabled_body_parts(cfg)
+    off = set(BODY_PARTS) - body_parts
+    bodies = [b for b in all_bodies if b.body_part not in off]
     parts = [np.array([c.part for c in cs]) for cs in caps]
     empty = ContactResult(False, source, len(bodies), (len(caps[0]), len(caps[1])), fingers,
                           np.full((T, 2, len(PARTS)), -np.inf), np.full((T, 2, len(PARTS)), -np.inf),
                           np.zeros((T, 2, 3)))
+    empty.info = dict(body_parts=_body_parts_info(body_parts, all_bodies), arm_mode=str(yield_mode))
     if not cfg.enabled or T == 0:
         return local, empty
 
@@ -794,5 +892,5 @@ def resolve_contacts(skel, rt, glob_rot, local, cfg, arm_cfg, finger_bones, yiel
                         for k_, pt in enumerate(PARTS) if pt in ('upper', 'fore', 'palm') or fingers},
                     max_correction_deg={j: float(corr[..., m].max(initial=0.0))
                                         for m, j in enumerate(('shoulder', 'elbow', 'wrist'))},
-                    radius_cm=radius)
+                    radius_cm=radius, **empty.info)
     return out, res
