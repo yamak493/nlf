@@ -10,7 +10,7 @@
 input:
   coords: auto              # auto | camera（Y下向き・Z奥向き）| yup（Y上向き・右手系）。auto は入力の coord_system、無ければ camera
   person_index: 0           # 複数人物が含まれる場合に扱う人物の番号
-  target_fps: 30.0          # リサンプル先の fps（MMD は 30fps）
+  target_fps: 30.0          # リサンプル先の fps（MMD は 30fps）。外れフレームの除外（1b・2）は入力の fps のまま行ってからリサンプルする
   max_gap_warn_sec: 0.5     # 人物を検出できなかった（valid=False の）区間がこれより長いと警告する。
                             # そのフレームは前後から補間しただけなので、床・接地・奥行き・前後の傾きの推定には使わない
 

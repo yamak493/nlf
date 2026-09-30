@@ -42,7 +42,7 @@ from scipy.sparse.linalg import splu
 
 from . import quat
 from .body_model import forward_kinematics
-from .filters import median_time, runs
+from .filters import frames_for_fps, median_time, runs
 from .lean import com_weights
 
 GRAVITY = 9.8
@@ -534,7 +534,7 @@ def turn_rate(G, joints, span=3, window=11):
 
 
 def detect_com(com, observed, fps, depth_axis, cfg, max_len, long_runs=None, max_iter=8,
-               huber=0.3):
+               huber=0.3, max_skip=MAX_SKIP, per_side=3):
     """重心 (T, 3)（Y 上向き・重力の向きにそろえた座標 [m]）の外れ。
 
     1. 慣性: 姿勢と同じく、前後のフレームからの予測との差で外れの候補を見つける（detect_part）
@@ -552,8 +552,8 @@ def detect_com(com, observed, fps, depth_axis, cfg, max_len, long_runs=None, max
     axis = np.asarray(depth_axis, np.float64) / np.linalg.norm(depth_axis)
     k = float(cfg.threshold)
     mins = (float(cfg.min_depth_m), float(cfg.min_m))
-    seeds, _ = detect_part(com_channels(com, axis), observed, k, mins, MAX_SKIP, max_len,
-                           long_runs=long_runs)
+    seeds, _ = detect_part(com_channels(com, axis), observed, k, mins, max_skip, max_len,
+                           per_side, long_runs=long_runs)
     fit = GravityFit(fps, axis, cfg, sigma=mins[1] / 2.0, sigma_depth=mins[0] / 2.0)
     w = (observed & ~seeds).astype(np.float64)
     flags = seeds
@@ -649,6 +649,12 @@ def remove_outliers(quats, root_pos, valid, rest_joints, parents, fps, cfg, grav
 
     max_len = int(np.floor(float(cfg.max_run_sec) * fps))
     max_ratio = float(cfg.max_ratio)
+    # フレーム数で決めた値（予測に使う前後のフレーム数・離して予測する間隔・向きの回転の速さの窓）は 30fps で決めたもの。
+    # 高い fps では同じ時間になるように増やす（フレーム数のままだと、予測に使う範囲が短くなり、数フレーム続く外れの
+    # 外側から予測できなくなる）
+    neighbours = frames_for_fps(cfg.pose.neighbours, fps)
+    max_skip = frames_for_fps(MAX_SKIP, fps)
+    turn_span, turn_window = frames_for_fps(3, fps), frames_for_fps(11, fps, odd=True)
     n_obs = max(int(observed.sum()), 1)
     flags, scores, skipped, long_runs = dict(empty), {n: np.zeros(T) for n in names}, {}, []
 
@@ -669,9 +675,8 @@ def remove_outliers(quats, root_pos, valid, rest_joints, parents, fps, cfg, grav
             y = part_points(G, P, base, joints, axes_of, float(cfg.pose.axis_length_m))
             dropped = []
             f, scores[name] = detect_part(y, observed, float(cfg.pose.threshold),
-                                          float(cfg.pose.min_m), MAX_SKIP, max_len,
-                                          int(cfg.pose.neighbours), turn_rate(G, axes_of),
-                                          dropped)
+                                          float(cfg.pose.min_m), max_skip, max_len, neighbours,
+                                          turn_rate(G, axes_of, turn_span, turn_window), dropped)
             flags[name] = accept(name, f, dropped)
             joint_mask[:, list(replace_joints)] |= flags[name][:, None]
         quats = interpolate_rotations(quats, joint_mask)
@@ -687,7 +692,8 @@ def remove_outliers(quats, root_pos, valid, rest_joints, parents, fps, cfg, grav
     if cfg.gravity.enabled:
         use = observed & ~flags['torso']
         dropped = []
-        f, scores['com'], fit = detect_com(com, use, fps, axis, cfg.gravity, max_len, dropped)
+        f, scores['com'], fit = detect_com(com, use, fps, axis, cfg.gravity, max_len, dropped,
+                                           max_skip=max_skip, per_side=frames_for_fps(3, fps))
         flags['com'] = accept('com', f, dropped)
         reposition |= flags['com']
     if reposition.any() and not reposition.all():

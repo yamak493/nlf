@@ -188,10 +188,11 @@ def format_metrics(metrics):
 
 
 # ---- グラフ ----
-def _bands(ax, flags, color, alpha=0.18):
+def _bands(ax, flags, color, alpha=0.18, scale=1.0):
+    """flags の True の区間を帯で描く。scale: フレーム番号に掛ける倍率（入力の fps の列を出力のフレーム番号で描くとき）。"""
     from .filters import runs
     for s, e in runs(flags):
-        ax.axvspan(s - 0.5, e + 0.5, color=color, alpha=alpha, lw=0)
+        ax.axvspan((s - 0.5) * scale, (e + 0.5) * scale, color=color, alpha=alpha, lw=0)
 
 
 def save_plots(r, out_dir):
@@ -205,19 +206,25 @@ def save_plots(r, out_dir):
     cm = 100.0 / k
     paths = {}
     feet = ('left foot', 'right foot')
+    # ステージ1b・2b は入力の fps のまま行うので、その結果は出力のフレーム番号に直して描く
+    src_scale = float(r.fps) / float(r.info.get('source_fps') or r.fps)
+
+    def src_frames(n):
+        return np.arange(n) * src_scale
 
     # 0. 慣性・重力による外れフレーム（部位ごとの外れの度合いと、重心の上下・奥行きの推定と重力の条件を満たす軌道）
     out = getattr(r, 'outliers', None)
     if out is not None and out.enabled:
+        o_frames = src_frames(len(out.valid))
         fig = Figure(figsize=(12, 9))
         axes = fig.subplots(3, 1, sharex=True)
         ax = axes[0]
         colors = dict(torso='tab:red', legs='tab:blue', head='tab:purple', left_arm='tab:green',
                       right_arm='tab:olive', com='black')
         for name, score in out.scores.items():
-            ax.plot(frames, np.minimum(score, 5.0), lw=0.8, color=colors.get(name),
+            ax.plot(o_frames, np.minimum(score, 5.0), lw=0.8, color=colors.get(name),
                     label=f'{name} ({int(out.flags[name].sum())} replaced)')
-            _bands(ax, out.flags[name], colors.get(name), alpha=0.15)
+            _bands(ax, out.flags[name], colors.get(name), alpha=0.15, scale=src_scale)
         ax.axhline(1.0, color='0.3', ls='--', lw=0.8)
         ax.set_ylabel('score (1 = threshold)')
         ax.set_title('outlier score per part (inertia) and centre of mass (gravity); '
@@ -228,10 +235,10 @@ def save_plots(r, out_dir):
             depth_axis = out.depth_axis / np.linalg.norm(out.depth_axis)
             for ax, label, f in ((axes[1], 'height', lambda c: c[:, 1]),
                                  (axes[2], 'depth (camera axis)', lambda c: c @ depth_axis)):
-                _bands(ax, com_frames, 'tab:red', alpha=0.15)
-                ax.plot(frames, f(out.com) * 100.0, color='0.5', lw=0.8, label='estimated')
+                _bands(ax, com_frames, 'tab:red', alpha=0.15, scale=src_scale)
+                ax.plot(o_frames, f(out.com) * 100.0, color='0.5', lw=0.8, label='estimated')
                 if out.com_fit is not None:
-                    ax.plot(frames, f(out.com_fit) * 100.0, color='tab:red', lw=1.0,
+                    ax.plot(o_frames, f(out.com_fit) * 100.0, color='tab:red', lw=1.0,
                             label='gravity-consistent')
                 ax.set_ylabel(f'CoM {label} [cm]')
                 ax.legend(loc='upper right', fontsize=8)
@@ -464,18 +471,20 @@ def save_plots(r, out_dir):
     # 2f. 手首の向きの補正（MediaPipe の手のひらの向きと NLF の手首の向きの差・掛けた補正・重み）
     if getattr(r, 'wrist', None) is not None:
         w = r.wrist
+        # 2b は平滑化と同じ fps（入力の fps が出力より高いときは入力の fps）で掛けている
+        w_frames = frames if len(w.weight) == len(frames) else src_frames(len(w.weight))
         fig = Figure(figsize=(12, 5))
         axes = fig.subplots(2, 1, sharex=True)
         for side, ax in enumerate(axes):
             name = ('left', 'right')[side]
             d = w.disagreement_deg[:, side]
-            ax.scatter(frames[:len(d)], d, s=4, color='0.55', label='NLF vs MediaPipe palm [deg]')
-            ax.plot(frames[:len(d)], w.correction_deg[:, side], color='tab:purple', lw=1.2,
+            ax.scatter(w_frames, d, s=4, color='0.55', label='NLF vs MediaPipe palm [deg]')
+            ax.plot(w_frames, w.correction_deg[:, side], color='tab:purple', lw=1.2,
                     label='applied correction [deg]')
             ax.set_ylim(0.0, 180.0)
             ax.set_ylabel('[deg]')
             ax2 = ax.twinx()
-            ax2.fill_between(frames[:len(d)], 0.0, w.weight[:, side], color='tab:green', alpha=0.15,
+            ax2.fill_between(w_frames, 0.0, w.weight[:, side], color='tab:green', alpha=0.15,
                              lw=0, label='weight of MediaPipe')
             ax2.set_ylim(0.0, 1.05)
             ax2.set_ylabel('weight')

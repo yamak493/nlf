@@ -27,6 +27,7 @@ class Motion:
     source_fps: float
     valid: np.ndarray
     fk_check_mm: float = float('nan')   # 入力の関節位置と、体モデルで作り直した関節位置の最大差
+    coords: str = 'yup'                 # 入力の座標系（camera / yup）。内部の値はどちらでも Y 上向き
 
     @property
     def num_frames(self):
@@ -79,15 +80,26 @@ def resample(quats, root_pos, valid, fps, target_fps):
     frac = w - lo
     q = quat.slerp(quats[lo], quats[hi], np.broadcast_to(frac[:, None], quats[lo].shape[:-1]))
     pos = np.stack([np.interp(t_dst, t_src, root_pos[:, k]) for k in range(3)], axis=1)
-    v = valid[np.clip(np.round(w).astype(int), 0, T - 1)]
-    return q, pos, v
+    return q, pos, resample_mask(valid, fps, target_fps)
 
 
-def load_motion(source, cfg_input, body_model):
+def resample_mask(mask, fps, target_fps):
+    """(T,) の bool 列を target_fps に揃える（最も近いフレームの値。resample と同じフレームの並び）。"""
+    mask = np.asarray(mask)
+    T = len(mask)
+    if target_fps <= 0 or abs(fps - target_fps) < 1e-6 or T < 2:
+        return mask
+    w = np.arange(0.0, (T - 1) / fps + 1e-9, 1.0 / target_fps) * fps
+    return mask[np.clip(np.round(w).astype(int), 0, T - 1)]
+
+
+def load_motion(source, cfg_input, body_model, resample_fps=True):
     """npz のパス、または同じキーを持つ dict から Motion を作る。
 
     必要なキー: pose（(T,24,3) 回転ベクトル / (T,24,4) / (T,24,3,3)）, betas, trans, fps
     任意: valid, joints3d（[mm]、体モデルの自己検証に使う）, coord_system（'camera' / 'yup'）
+    resample_fps: False なら入力の fps のまま返す（cfg_input.target_fps へのリサンプルは呼び出し側で行う。
+    convert は、外れフレームの除外とジッター制御を入力の fps で掛けてからリサンプルする）
     """
     d = _select_person(_as_dict(source), int(cfg_input.person_index))
     quats = _pose_to_quats(d['pose'])
@@ -130,6 +142,8 @@ def load_motion(source, cfg_input, body_model):
         raise ValueError(f'input.coords は auto / camera / yup のいずれかです: {coords}')
 
     quats = quat.make_continuous(quats)
+    if not resample_fps:
+        return Motion(quats, betas, pelvis, fps, fps, valid, fk_check, coords)
     quats, pelvis, valid = resample(quats, pelvis, valid, fps, float(cfg_input.target_fps))
     out_fps = float(cfg_input.target_fps) if cfg_input.target_fps > 0 else fps
-    return Motion(quat.make_continuous(quats), betas, pelvis, out_fps, fps, valid, fk_check)
+    return Motion(quat.make_continuous(quats), betas, pelvis, out_fps, fps, valid, fk_check, coords)

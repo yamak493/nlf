@@ -371,7 +371,9 @@ PMX を指定すると、モデルに無いモーフ名は警告を出してキ�
 
 ノートブックのセル 10 が、動画から左右の手の指の 21 点を求めます（`hand_detect.py`）。
 
-1. NLF の手首と手先の関節（VMD の変換のステージ 2 と同じジッター制御を掛けたもの。`hand_detect.stabilized_joints`）を画像に投影し、手首のまわりを MediaPipe と同じ形（手首→指の付け根が上を向く正方形）に切り出す
+1. NLF の手首と手先の関節（VMD の変換のステージ 1b・2 と同じ外れフレームの除外・ジッター制御を、動画の fps のまま掛けたもの。
+   `pipeline.prepare` → `hand_detect.prepared_joints`）を画像に投影し、手首のまわりを MediaPipe と同じ形（手首→指の付け根が上を向く正方形）に切り出す。
+   `prepare` の結果は `convert(..., prepared=...)` に渡すと変換でもそのまま使う（入力・体モデル・関係する設定が同じときだけ。違えば変換が求め直す）
 2. [MediaPipe Hands](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker) の `hand_landmarker.task` に入っている
    ランドマークモデル（`hand_landmarks_detector.tflite`）に、[LiteRT](https://ai.google.dev/edge/litert)（`ai-edge-litert`）で直接入れる。
    1 回目の結果から MediaPipe のトラッキングと同じ方法で切り出しを作り直し、もう一度推定する

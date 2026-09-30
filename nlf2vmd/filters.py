@@ -3,6 +3,22 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d, median_filter, minimum_filter1d
 
 
+REFERENCE_FPS = 30.0   # フレーム数で書いた設定（メディアンの窓幅・外れの予測に使うフレーム数など）を決めた fps
+
+
+def frames_for_fps(n, fps, odd=False):
+    """30fps で決めたフレーム数 n を、fps で使う値にする。
+
+    fps が 30 より高いときは同じ時間になるように増やし、低いときは n のまま（フレーム数を減らすと、窓が小さすぎて
+    メディアン・予測が成り立たなくなるため）。odd なら、増やした値を奇数にする（メディアンの窓の中心を保つ）。
+    """
+    n = int(n)
+    m = max(n, int(round(n * float(fps) / REFERENCE_FPS)))
+    if odd and m != n and m % 2 == 0:
+        m += 1
+    return m
+
+
 def _alpha(cutoff, fps):
     tau = 1.0 / (2.0 * np.pi * np.asarray(cutoff, np.float64))
     return 1.0 / (1.0 + tau * fps)

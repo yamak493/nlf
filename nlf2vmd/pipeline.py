@@ -2,7 +2,16 @@
 
 順番を入れ替えないこと。特に「床オフセット → 接地判定 → ロック → クランプ」の順が崩れると、
 接地判定の基準がずれたり、ロック値に歪んだ値が混ざる。
+
+外れフレームの除外（ステージ1b と、ステージ2の単独フレームの外れ値の除去）は入力の fps のまま行い、MMD の fps
+（input.target_fps）へのリサンプルはその後で行う。先にリサンプルすると、元の fps が 30 の整数倍・約数でない
+（24・25fps など）とき、1 フレームだけの推定の破綻が補間で前後 2 フレームに薄まって広がり、外れとして見つからない。
+ステージ2の平滑化（と 2b）は、入力と出力の fps の高いほうで掛ける（60fps の入力は間引く前に平滑化して、捨てる
+フレームの観測もノイズの低減に使う。24・25fps の入力は補間した後に平滑化する。合成データでは、どちらもこの順が
+逆の順より正解に近かった）。
 """
+import hashlib
+import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -17,14 +26,14 @@ from .contact import detect_contacts
 from .contacts import resolve_contacts
 from .depth import depth_axis, depth_jitter, detection_speeds, reconstruct_depth
 from .floor import estimate_floor
-from .filters import runs
+from .filters import frames_for_fps, runs
 from .foot_ik import boundary_steps, build_foot_ik
 from .ground import floating_frames, ground_offset
 from .hand_reach import keep_hand_positions
-from .jitter import stabilize_pose, stabilize_root
+from .jitter import remove_rotation_outliers, stabilize_pose, stabilize_root
 from .lean import estimate_lean
 from .legs import knee_poles, solve_legs
-from .motion_io import load_motion
+from .motion_io import load_motion, resample, resample_mask
 from .outliers import PART_LABELS, remove_outliers
 from .pmx import PmxModel, read_pmx
 from .retarget import Retargeter
@@ -113,6 +122,114 @@ def resolve_body_model(body_model, source):
         raise RuntimeError(
             'SMPL の体モデルが見つかりません。ノートブックのセル 9 で書き出した '
             f'{BODY_MODEL_FILENAME} を --body-model で指定してください。') from e
+
+
+@dataclass
+class PreparedMotion:
+    """ステージ1・1b・2（読み込み・外れフレームの除外・ジッター制御）の結果。入力の fps のまま。
+
+    ノートブックでは、手を切り出す位置（hand_detect.prepared_joints）と convert が同じものを使う
+    （convert(..., prepared=...)。入力・体モデル・関係する設定が同じときだけ使い回し、違えば求め直す）。
+    """
+    motion: object               # Motion（入力の fps。quats・root_pos は 1b で外れを置き換えたもの、valid は 1b の後の観測）
+    valid_input: np.ndarray      # (T,) 入力の valid（人物を検出できたフレーム）
+    outliers: object             # OutlierResult（1b を使わないときは None）
+    despiked: np.ndarray         # (T, J, 4) 1b の後に、単独フレームの外れ値だけを除いた回転（平滑化する前）
+    quats: np.ndarray            # (T, J, 4) ステージ2の後の回転（入力の fps で平滑化したもの）
+    root: np.ndarray             # (T, 3) ステージ2の後の骨盤の位置
+    jitter_info: dict
+    rest: object                 # rest_info（体型を固定した初期姿勢の関節・接地点）
+    rest_joints: np.ndarray
+    parents: np.ndarray
+    key: str                     # 入力・体モデル・設定の指紋（prepare_key）
+
+
+# 床の設定のうち、1b の仮の床（重力の向き）に効かないもの。変えても 1〜2 はやり直さない
+# （flip_facing は鉛直軸まわりの 180 度で、重力の向きも奥行きの軸の向きの取り方も変わらない。1b では使わない）
+_FLOOR_KEYS_UNUSED_BY_PREPARE = ('flip_facing', 'horizontal_origin', 'segment_mode', 'segment_sec',
+                                 'segment_blend_sec')
+
+
+def prepare_key(motion, bm, cfg):
+    """ステージ1〜2 の結果を決めるもの（入力の値・体モデル・設定の body / floor / outliers / jitter）の指紋。"""
+    h = hashlib.sha1()
+    for a in (motion.quats, motion.root_pos, motion.valid, motion.betas, [motion.fps],
+              bm.rest_joints(motion.betas), bm.rest_vertices(motion.betas), bm.parents):
+        h.update(np.ascontiguousarray(np.asarray(a)).tobytes())
+    floor = {k: v for k, v in cfg.floor.to_dict().items() if k not in _FLOOR_KEYS_UNUSED_BY_PREPARE}
+    sections = dict(body=cfg.body.to_dict(), floor=floor, outliers=cfg.outliers.to_dict(),
+                    jitter=cfg.jitter.to_dict(), coords=motion.coords)
+    h.update(json.dumps(sections, sort_keys=True, default=str).encode('utf-8'))
+    return h.hexdigest()
+
+
+def _prepare(motion, bm, cfg):
+    fps = motion.fps
+    valid_input = np.asarray(motion.valid, bool)
+    key = prepare_key(motion, bm, cfg)
+    rest = rest_info(bm, motion.betas, int(cfg.body.heel_toe_vertices), float(cfg.body.sole_band_m))
+    rest_joints = bm.rest_joints(motion.betas)
+
+    # ---- 1b. 慣性・重力による外れフレームの除外 ----
+    # 重力の向き（床の法線）は、外れを除く前の体で仮に求める（ステージ4で外れを除いた体から求め直す）。
+    # 体の向きの反転（flip_facing）は重力の向きを変えないので、ここでは掛けない
+    outliers = None
+    if cfg.outliers.enabled:
+        floor_cfg = Config(dict(cfg.floor, flip_facing=False))
+        pre_floor = estimate_floor(compute_kinematics(motion.quats, motion.root_pos, rest), fps,
+                                   floor_cfg, rest.points.mean(2), valid_input)
+        outliers = remove_outliers(motion.quats, motion.root_pos, valid_input, rest_joints, bm.parents,
+                                   fps, cfg.outliers, pre_floor.rotation,
+                                   depth_axis(pre_floor.rotation))
+        motion = replace(motion, quats=outliers.quats, root_pos=outliers.root_pos,
+                         valid=outliers.valid)
+
+    # ---- 2. 姿勢のジッター制御（入力の fps で。平滑化する前の、単独フレームの外れ値を除いただけの回転も残す）----
+    despiked, _ = remove_rotation_outliers(quat.make_continuous(motion.quats), fps,
+                                           float(cfg.jitter.outlier_deg_per_s))
+    quats, jitter_info = stabilize_pose(motion.quats, fps, cfg.jitter, rest_joints)
+    root = stabilize_root(motion.root_pos,
+                          frames_for_fps(cfg.jitter.root_median_window, fps, odd=True))
+    return PreparedMotion(motion, valid_input, outliers, despiked, quats, root, jitter_info, rest,
+                          rest_joints, np.asarray(bm.parents), key)
+
+
+def prepare(source, body_model=None, config=None, overrides=None):
+    """ステージ1・1b・2 を入力の fps のまま行う（PreparedMotion）。convert(..., prepared=...) に渡すと使い回す。"""
+    cfg = config if isinstance(config, Config) and not overrides else load_config(config, overrides)
+    bm = resolve_body_model(body_model, source)
+    return _prepare(load_motion(source, cfg.input, bm, resample_fps=False), bm, cfg)
+
+
+def log_prepared(prepared, cfg, log, warn, reused=False):
+    motion, fps = prepared.motion, prepared.motion.fps
+    target = float(cfg.input.target_fps)
+    log(f'[1] 読み込み: {motion.num_frames} フレーム @ {fps:g} fps'
+        + (f'（{target:g} fps へは、外れフレームの除外・ジッター制御・手首の補正の後でリサンプルします）'
+           if target > 0 and abs(fps - target) > 1e-6 else '')
+        + ('。1〜2 は手の検出のときに求めたものを使います' if reused else ''))
+    gaps = runs(~prepared.valid_input)
+    if gaps:
+        longest = max(e - s + 1 for s, e in gaps) / fps
+        log(f'    検出できなかった（前後から補間した）フレーム: {int((~prepared.valid_input).sum())} '
+            f'（{len(gaps)} 区間・最長 {longest:.2f} 秒）。床・接地・奥行き・傾きの推定には使いません')
+        if longest > float(cfg.input.max_gap_warn_sec):
+            warn(f'人物を検出できなかった区間が {longest:.1f} 秒続いています（補間しただけの動きです）')
+    if np.isfinite(motion.fk_check_mm):
+        log(f'    体モデルの自己検証: 入力の関節との最大差 {motion.fk_check_mm:.2f} mm')
+        if motion.fk_check_mm > 20.0:
+            warn('体モデルと入力の関節位置が一致しません。体モデルのファイルを確認してください')
+    if prepared.outliers is not None:
+        log_outliers(prepared.outliers, fps, log, warn)
+
+
+def log_jitter(info, log):
+    hold = ''
+    if 'hand_hold_ratio' in info:
+        left, right = (v * 100.0 for v in info['hand_hold_ratio'])
+        hold = (f' / 手首の位置の軌跡に合わせたフレーム 左 {left:.0f}%・右 {right:.0f}%'
+                f'（肩・ひじの補正 最大 {info["hand_hold_max_deg"]:.1f} 度）')
+    log(f'[2] ジッター制御: 外れ値として置き換えたフレーム {info["outlier_frames"]}' + hold)
 
 
 def apply_scale(kin, k, depth_scale):
@@ -303,7 +420,7 @@ def apply_hand_poses(result, hand_tracks, log=print):
 
 
 def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=None,
-            diag_dir=None, log=print, hands_analysis=None):
+            diag_dir=None, log=print, hands_analysis=None, prepared=None):
     """NLF のモーション（npz のパス、または pose / betas / trans / fps を持つ dict）を VMD に変換する。
 
     out_path: 書き出す .vmd（フル: 体の動きすべて）。None なら書き出さない（variants.write_variant で
@@ -313,6 +430,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     diag_dir: 診断出力（JSON・PNG）の保存先。None なら <VMD 名>_diag/（out_path も None なら保存しない）
     hands_analysis: 手のランドマークの検出結果（hands.save_analysis の npz のパスか dict）。渡すと、
     ステージ2b で手首の向きを MediaPipe の手のひらの向きへ寄せる（フレーム 0 は source のフレーム 0 とそろえる）
+    prepared: prepare() の結果（ステージ1〜2）。source・体モデル・関係する設定が同じなら使い回し、違えば求め直す
     """
     cfg = config if isinstance(config, Config) and not overrides else load_config(config,
                                                                                   overrides)
@@ -338,54 +456,41 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
             warn(f'{s}つま先ＩＫ が無いモデルです（足ＩＫの回転が足首に伝わらず、足先の向きが変わりません）')
     bm = resolve_body_model(body_model, source)
 
-    # ---- 1. 読み込み・正規化 ----
-    motion = load_motion(source, cfg.input, bm)
-    fps = motion.fps
-    log(f'[1] 読み込み: {motion.num_frames} フレーム @ {fps:g} fps（元 {motion.source_fps:g} fps）')
-    if abs(fps - 30.0) > 1e-6:
-        warn(f'MMD は 30fps で再生します（出力は {fps:g}fps）。input.target_fps を 30 にしてください')
-    valid = np.asarray(motion.valid, bool)
-    gaps = runs(~valid)
-    longest_gap = max((e - s + 1 for s, e in gaps), default=0) / fps
-    if gaps:
-        log(f'    検出できなかった（前後から補間した）フレーム: {int((~valid).sum())} '
-            f'（{len(gaps)} 区間・最長 {longest_gap:.2f} 秒）。床・接地・奥行き・傾きの推定には使いません')
-        if longest_gap > float(cfg.input.max_gap_warn_sec):
-            warn(f'人物を検出できなかった区間が {longest_gap:.1f} 秒続いています（補間しただけの動きです）')
-    if np.isfinite(motion.fk_check_mm):
-        log(f'    体モデルの自己検証: 入力の関節との最大差 {motion.fk_check_mm:.2f} mm')
-        if motion.fk_check_mm > 20.0:
-            warn('体モデルと入力の関節位置が一致しません。体モデルのファイルを確認してください')
+    # ---- 1. 読み込み・正規化 / 1b. 慣性・重力による外れフレームの除外 / 2. 姿勢のジッター制御 ----
+    # 外れフレームの除外は入力の fps のまま行う（MMD の fps へのリサンプルはその後）。prepared（手の検出のときに
+    # 求めたもの）が同じ入力・体モデル・設定のものなら使い回す
+    motion_in = load_motion(source, cfg.input, bm, resample_fps=False)
+    reused = prepared is not None and prepared.key == prepare_key(motion_in, bm, cfg)
+    if not reused:
+        prepared = _prepare(motion_in, bm, cfg)
+    log_prepared(prepared, cfg, log, warn, reused)
+    motion, outliers = prepared.motion, prepared.outliers
+    rest, rest_joints = prepared.rest, prepared.rest_joints
+    src_fps = motion.fps
+    target_fps = float(cfg.input.target_fps)
+    fps = target_fps if target_fps > 0 else src_fps
+    # 処理前（診断の「処理前」・奥行きの再構成の姿勢）は 1b の後の値をリサンプルしたもの
+    raw_q, raw_root, valid = resample(motion.quats, motion.root_pos, np.asarray(motion.valid, bool),
+                                      src_fps, fps)
+    valid_input = resample_mask(prepared.valid_input, src_fps, fps)
 
-    # ---- 1b. 慣性・重力による外れフレームの除外 ----
-    # 重力の向き（床の法線）は、外れを除く前の体で仮に求める（ステージ4で外れを除いた体から求め直す）
-    rest = rest_info(bm, motion.betas, int(cfg.body.heel_toe_vertices),
-                     float(cfg.body.sole_band_m))
-    rest_joints = bm.rest_joints(motion.betas)
-    valid_input = valid
-    outliers = None
-    if cfg.outliers.enabled:
-        pre_floor = estimate_floor(compute_kinematics(motion.quats, motion.root_pos, rest), fps,
-                                   cfg.floor, rest.points.mean(2), valid)
-        outliers = remove_outliers(motion.quats, motion.root_pos, valid, rest_joints, bm.parents,
-                                   fps, cfg.outliers, pre_floor.rotation,
-                                   depth_axis(pre_floor.rotation))
-        motion = replace(motion, quats=outliers.quats, root_pos=outliers.root_pos,
-                         valid=outliers.valid)
-        valid = outliers.valid
-        log_outliers(outliers, fps, log, warn)
+    # 平滑化は入力と出力の fps の高いほうで掛ける（入力のほうが高ければ入力の fps で平滑化してから間引き、
+    # 低ければ、単独フレームの外れ値を除いた回転を補間してから平滑化する）
+    smooth_at_source = src_fps >= fps - 1e-6
+    if smooth_at_source:
+        quats, root, jitter_info = prepared.quats, prepared.root, prepared.jitter_info
+        smooth_fps = src_fps
+    else:
+        q, r, _ = resample(prepared.despiked, motion.root_pos, valid_input, src_fps, fps)
+        quats, jitter_info = stabilize_pose(quat.make_continuous(q), fps, cfg.jitter, rest_joints)
+        root = stabilize_root(r, cfg.jitter.root_median_window)
+        # 単独フレームの外れ値は入力の fps で除いたもの（補間の後にはほとんど残らない）も数える
+        for key in ('outlier_frames', 'outlier_joint_frames'):
+            jitter_info[key] += prepared.jitter_info[key]
+        smooth_fps = fps
+    log_jitter(jitter_info, log)
 
-    # ---- 2. 姿勢のジッター制御 ----
-    quats, jitter_info = stabilize_pose(motion.quats, fps, cfg.jitter, rest_joints)
-    root = stabilize_root(motion.root_pos, cfg.jitter.root_median_window)
-    hold = ''
-    if 'hand_hold_ratio' in jitter_info:
-        left, right = (v * 100.0 for v in jitter_info['hand_hold_ratio'])
-        hold = (f' / 手首の位置の軌跡に合わせたフレーム 左 {left:.0f}%・右 {right:.0f}%'
-                f'（肩・ひじの補正 最大 {jitter_info["hand_hold_max_deg"]:.1f} 度）')
-    log(f'[2] ジッター制御: 外れ値として置き換えたフレーム {jitter_info["outlier_frames"]}' + hold)
-
-    # ---- 2b. 手首の向きの補正（MediaPipe Hands） ----
+    # ---- 2b. 手首の向きの補正（MediaPipe Hands。平滑化と同じ fps で） ----
     wrist = None
     if hands_analysis is not None and cfg.wrist.enabled:
         from .hands import load_analysis
@@ -397,7 +502,7 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
             def fk(q):
                 return forward_kinematics(q, root, rest_joints, bm.parents)[0]
 
-            quats, wrist = correct_wrists(quats, fk, rest_joints, analysis, fps, cfg.wrist,
+            quats, wrist = correct_wrists(quats, fk, rest_joints, analysis, smooth_fps, cfg.wrist,
                                           cfg.wrist_limits)
             parts = []
             for s, name in zip(SIDES, ('left', 'right')):
@@ -408,6 +513,20 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
                                 f'・NLF との差の中央値 {med:.0f} 度'
                                 f'（45 度超 {d["disagreement_over_45_ratio"] * 100:.0f}%）'))
             log('[2b] 手首の向きの補正（MediaPipe）: ' + ' / '.join(parts))
+
+    # ---- 1（続き）. MMD の fps へのリサンプル（回転は球面線形補間、位置は線形補間） ----
+    if smooth_at_source:
+        quats, root, _ = resample(quats, root, valid_input, src_fps, fps)
+    quats = quat.make_continuous(quats)
+    motion = replace(motion, quats=quat.make_continuous(raw_q), root_pos=raw_root, valid=valid,
+                     fps=fps)
+    if abs(fps - src_fps) > 1e-6:
+        log(f'[1] リサンプル: {len(prepared.quats)} フレーム @ {src_fps:g} fps → '
+            f'{motion.num_frames} フレーム @ {fps:g} fps（平滑化は {smooth_fps:g} fps で掛けました）')
+    if abs(fps - 30.0) > 1e-6:
+        warn(f'MMD は 30fps で再生します（出力は {fps:g}fps）。input.target_fps を 30 にしてください')
+    gaps = runs(~valid_input)
+    longest_gap = max((e - s + 1 for s, e in gaps), default=0) / fps
 
     # ---- 3. FK で関節位置・かかと・つま先を算出 ----
     kin = compute_kinematics(quats, root, rest)

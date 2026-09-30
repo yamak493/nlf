@@ -94,7 +94,7 @@ Demucs `htdemucs` は MUSDB18-HQ（非商用の研究用）と Meta 社内の楽
 | ファイル | 理由 |
 |---|---|
 | `smpl_body_model.npz` | SMPL の本体（テンプレートの頂点・体型のブレンドシェイプ・スキニングの重み）。SMPL のライセンスで再配布が禁止されている |
-| `motion.npz`（`vertices3d` を含む） | SMPL のメッシュの頂点。上と同じ扱いにする |
+| `motion.npz`（セル 6 の `SAVE_VERTICES=True` のときは `vertices3d` を含む） | SMPL のメッシュの頂点。上と同じ扱いにする |
 | `segment_audio.wav`・`vocals.wav` | 元の楽曲の音声（楽曲の著作権） |
 | `nlf_l_multi_0.3.2.torchscript`・`hand_landmarker.task` | 各配布元から取得してもらう |
 
