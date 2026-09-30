@@ -71,9 +71,9 @@ def _crossing(T, depth_from, depth_to):
     return Y, O, radius[ac.PAIR_Y] + radius[ac.PAIR_O] + 0.005
 
 
-def _params(fps=30.0):
-    return ac._Params(np.deg2rad(45.0), ac.MIN_LEVER_M, ac.TOLERANCE_M, ac.DAMPING_M ** 2,
-                      np.deg2rad(120.0) / fps)
+def _params(fps=30.0, depth_cost=1.0, max_deg=45.0, axis=(0.0, 0.0, 1.0)):
+    return ac._Params(np.deg2rad(max_deg), ac.MIN_LEVER_M, ac.TOLERANCE_M, ac.DAMPING_M ** 2,
+                      np.deg2rad(120.0) / fps, np.asarray(axis, float), depth_cost ** 2)
 
 
 def _apply(Y, Q):
@@ -109,6 +109,81 @@ def test_yielding_arm_passes_through_gradually_beyond_the_limit():
     assert angle[-1] < np.deg2rad(1.0)                   # 最後は推定の姿勢に戻る
     steps = np.rad2deg(quat.angle_between(quat.from_matrix(Q[1:]), quat.from_matrix(Q[:-1])))
     assert steps.max() < 2.0 * np.rad2deg(p.return_step) + 1.0
+
+
+# ---- 奥行き優先（depth_cost）----
+def _stacked(T, gap):
+    """(自重する左腕 Y, 相手の右腕 O, 離す距離 R)。両腕を上げて前腕を胸の高さより上で水平にし、画像上で上下に gap [m]
+    離して重ねる（前腕は肩と同じ奥行き = 画像面内。相手の前腕がわずかに手前）。最近点を結ぶ向きは上下（画像面内）。"""
+    Y = np.tile([[0.2, 0.0, 0.0], [0.3, 0.3, 0.0], [-0.05, 0.3, 0.0], [-0.15, 0.3, 0.0]], (T, 1, 1))
+    O = np.tile([[-0.2, 0.0, 0.0], [-0.3, 0.3, 0.0], [0.05, 0.3, 0.0], [0.15, 0.3, 0.0]], (T, 1, 1))
+    O[:, 1:, 1] -= gap
+    O[:, 1:, 2] += 0.002
+    radius = np.array([0.03, 0.03, 0.02])
+    return Y, O, radius[ac.PAIR_Y] + radius[ac.PAIR_O] + 0.005
+
+
+def _solve_stacked(depth_cost, max_deg=45.0, rotation=np.eye(3)):
+    T = 10
+    Y, O, R = _stacked(T, 0.05)
+    Y, O = Y @ rotation.T, O @ rotation.T
+    p = _params(depth_cost=depth_cost, max_deg=max_deg, axis=rotation @ [0.0, 0.0, 1.0])
+    Q, ignored = ac._resolve_sequential(Y, O, R, np.tile(rotation, (T, 1, 1)), p)
+    fixed = _apply(Y, Q)
+    cp, cq = ac._pairs(fixed, O)
+    overlap = (R - np.linalg.norm(cp - cq, axis=-1)).max(1)
+    image, depth = ac._shift(Y, fixed, p.axis)
+    return Q, ignored, overlap, image[-1], depth[-1]
+
+
+def test_depth_cost_moves_the_arm_along_the_camera_axis():
+    """画像上で上下に重なった前腕を、depth_cost = 1 は上下（画像面内）に、0.5 は主に前後（奥行き）にずらして離す。"""
+    _, ignored1, overlap1, image1, depth1 = _solve_stacked(1.0)
+    _, ignored, overlap, image, depth = _solve_stacked(0.5)
+    assert not ignored1.any() and not ignored.any()
+    assert (overlap1 < 1e-3).all() and (overlap < 1e-3).all()
+    assert image1 > 2.0 * depth1                   # 向きを区別しないと、最近点を結ぶ向き（上下）へずらす
+    assert depth > 2.0 * image                     # 奥行き優先なら前後へずらす
+    assert image < 0.5 * image1
+
+
+def test_depth_cost_follows_the_given_camera_axis():
+    """カメラの奥行きの軸ごと全体を回しても、腕の動き（画像面内・奥行きの移動量）は変わらない。"""
+    rotation = quat.to_matrix(quat.from_rotvec(np.array([0.3, -0.8, 0.5])))
+    _, _, _, image, depth = _solve_stacked(0.5)
+    _, _, overlap, image_r, depth_r = _solve_stacked(0.5, rotation=rotation)
+    assert (overlap < 1e-3).all()
+    np.testing.assert_allclose([image_r, depth_r], [image, depth], atol=1e-4)
+
+
+def test_depth_cost_falls_back_to_the_shortest_shift_at_the_limit():
+    """奥行きへずらすと max_deg を超えるときは、向きを区別せずに（最近点を結ぶ向きへ）解き直して離す。"""
+    Q1, _, _, image1, depth1 = _solve_stacked(1.0)
+    limit = np.rad2deg(ac._angle(Q1[-1])) + 0.5     # 最近点を結ぶ向きへずらすなら上限に届かない
+    Y, O, R = _stacked(1, 0.05)
+    p = _params(depth_cost=0.3, max_deg=limit)
+    Q = ac._solve_frame(Y[0], O[0], R, np.eye(3), p, np.eye(3))
+    assert ac._angle(Q) >= p.max_angle - 1e-6          # 奥行き優先だけでは上限に達して
+    assert ac._overlapping(Y[0], O[0], R, Q, p.tol).any()   # 離れない
+    _, ignored, overlap, image, depth = _solve_stacked(0.3, max_deg=limit)
+    assert not ignored.any()
+    assert (overlap < 1e-3).all()
+    np.testing.assert_allclose([image, depth], [image1, depth1], atol=1e-6)
+
+
+def test_depth_cost_in_the_pipeline(body_model):
+    motion = add_arm_cross(synthetic_walk(num_frames=30))
+    iso = _convert(body_model, motion, 'left', extra=['arm_collision.depth_cost=1.0']).arm_collision
+    r = _convert(body_model, motion, 'left')           # 既定は depth_cost 0.5
+    a = r.arm_collision
+    assert a.depth_cost == 0.5 and iso.depth_cost == 1.0
+    assert a.overlap_frames(0.005 * r.scale)[1] == 0
+    assert a.shift_image.max() < iso.shift_image.max()
+    assert a.shift_depth.max() > iso.shift_depth.max()
+    assert r.info['arm_collision']['max_shift_cm']['depth'] > 0.0
+    for bad in ('0', '1.5'):
+        with pytest.raises(ValueError):
+            _convert(body_model, motion, 'left', extra=[f'arm_collision.depth_cost={bad}'])
 
 
 def test_no_change_when_the_arms_do_not_touch(body_model):

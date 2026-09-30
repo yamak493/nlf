@@ -17,9 +17,15 @@
   補正が max_deg に達したときだけ、通り抜けて推定の側に移る）
 * 離す向きは、重なっている 2 本のカプセルの最近点を結ぶ向き。肩のすぐ近くの重なり（相手の手が肩に触れている
   等）は、肩まわりに回しても離せないので扱わない
+* **奥行き優先**（depth_cost < 1）: 単眼推定では、画像面内（上下左右）の腕の位置は動画に写ったとおりで確かだが、
+  カメラの奥行き方向の位置はぶれる。そこで、腕（ひじ・手首・手の先）をカメラの奥行き方向へ動かす回転を安く見積もり
+  （肩まわりの回転のコストのうち、奥行き方向へ動かす分を depth_cost² 倍にする）、画像面内の動きを自重して前後へずらす。
+  重なっている組の離す向きも、最近点を結ぶ向きと奥行きの軸の間から、そのコストで最も安く離せる向きを選ぶ（横に
+  並んで重なった腕も、前後へずらして離せる）。前後の順（どちらの腕が手前か）は推定のまま。奥行きを優先して回転角が
+  max_deg に達しても離れないフレームは、向きを区別せずに（depth_cost = 1 として）解き直す
 * 補正の回転を肩の親（肩ボーン）の座標系で時間方向にならしてから、ならして浅くなった重なりをもう一度離す
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -42,6 +48,8 @@ TOLERANCE_M = 1e-4
 HAND_TIP_PERCENTILE = 95.0
 MIN_VERTICES = 20             # 半径を測る頂点がこれより少ない部位は設定の値を使う
 DEEP_START = 0.5              # 持ち越す補正が無いのに、半径の和のこの割合より深く重なっていれば別の向きからも解く
+DEPTH_SAMPLES = 13            # 奥行き優先: 離す向きの候補の数（最近点を結ぶ向きから奥行きの軸までの 90 度を等分）
+SAME_DEPTH = 0.02             # 奥行き優先: 離す向きの奥行きの成分がこれより小さい（最近点がほぼ同じ奥行き）なら前後どちらへも離せる
 OVERLAP_TOL_M = 0.005         # 評価指標: カプセルがこれより深く重なったフレームを「重なり」と数える
 _EPS = 1e-9
 
@@ -63,6 +71,10 @@ class ArmCollisionResult:
     correction_deg: np.ndarray   # (T,) 自重する腕に掛けた補正の回転角 [度]
     depth_before: np.ndarray     # (T,) 左右の腕のカプセルの最も深い重なり [MMD 単位]（負 = 離れている）
     depth_after: np.ndarray
+    # (T,) 補正で自重する腕（ひじ・手首・手の先）が動いた距離の最大 [MMD 単位]。画像面内（カメラの奥行きの軸に垂直）と奥行き
+    shift_image: np.ndarray = None
+    shift_depth: np.ndarray = None
+    depth_cost: float = 1.0
 
     def overlap_frames(self, tol):
         """(処理前, 処理後) カプセルが tol [MMD 単位] より深く重なっているフレーム数。"""
@@ -275,6 +287,64 @@ class _Params:
     tol: float
     damping: float
     return_step: float    # 1 フレームに推定の姿勢へ戻す角度の上限 [rad]
+    axis: np.ndarray = None       # (3,) カメラの奥行きの軸（内部座標の単位ベクトル）
+    depth_weight: float = 1.0     # 腕を奥行き方向へ動かす回転のコストの倍率（depth_cost²。1 なら向きを区別しない）
+
+    @property
+    def prefers_depth(self):
+        return self.axis is not None and self.depth_weight < 1.0
+
+
+def _metric(Y, p):
+    """(3, 3) 肩まわりの回転 ω のコスト ωᵀ M ω の M（奥行き優先）。
+
+    |ω|² から、腕の点 k（ひじ・手首・手の先。肩からの向き r̂_k）が奥行き方向へ動く速さ a·(ω × r̂_k) = ω·(r̂_k × a)
+    の 2 乗の平均の (1 − depth_weight) 倍を引く。奥行き方向へ腕を振る回転ほど安く、画像面内で振る回転・腕の軸まわりの
+    ひねりは |ω|² のまま。M ≥ depth_weight·I なので正定値。
+    """
+    r = Y[1:] - Y[0]
+    u = _cross(r, p.axis) / np.maximum(np.linalg.norm(r, axis=-1, keepdims=True), _EPS)
+    return np.eye(3) - (1.0 - p.depth_weight) * (u.T @ u) / len(u)
+
+
+def _depth_normals(v, d, n, pen, R, M_inv, p):
+    """奥行き優先: 重なっている組の離す向き n と重なり pen を選び直す。
+
+    v: (9, 3) 肩から自重する腕の最近点 / d: (9, 3) 最近点どうしの差 / M_inv: _metric の逆行列。
+    離す向き n' の候補は、n と奥行きの軸 a の間（n の画像面内の成分の向き ê と ±a を結ぶ 4 分の 1 の円）。n'·d ≥ R
+    なら |d| ≥ R なので、どの n' で離しても重ならない。肩まわりの回転で n'·d を必要なだけ増やすコストは
+    (R − n'·d)² / ((v × n')ᵀ M⁻¹ (v × n')) なので、それが最も小さい n' を選ぶ（n' = n は最近点を結ぶ向きで、
+    必要な移動が最も短い。奥行き寄りの n' ほど必要な移動は長いが、奥行き方向の移動は安い）。前後の順は推定のまま
+    （最近点がほぼ同じ奥行きの組だけ、前後どちらへも離せる）。
+    """
+    a = p.axis
+    over = pen > p.tol
+    along = n @ a
+    e = n - along[:, None] * a
+    e_norm = np.linalg.norm(e, axis=-1)
+    over &= e_norm > 1e-6          # すでに奥行きの軸に沿って離している組はそのまま
+    if not over.any():
+        return n, pen
+    idx = np.flatnonzero(over)
+    e_hat = e[idx] / e_norm[idx, None]
+    lo = np.where(along[idx] > SAME_DEPTH, 0.0, -0.5 * np.pi)
+    hi = np.where(along[idx] < -SAME_DEPTH, 0.0, 0.5 * np.pi)
+    phi = lo[:, None] + (hi - lo)[:, None] * np.linspace(0.0, 1.0, DEPTH_SAMPLES)
+    phi = np.concatenate([np.arctan2(along[idx], e_norm[idx])[:, None], phi], axis=1)   # 先頭は n
+    cand = np.cos(phi)[..., None] * e_hat[:, None] + np.sin(phi)[..., None] * a       # (m, K, 3)
+    need = R[idx, None] - np.einsum('mkc,mc->mk', cand, d[idx]) + p.tol
+    j = _cross(v[idx, None], cand)
+    ease = np.einsum('mkc,cd,mkd->mk', j, M_inv, j)
+    # 肩まわりに回しても離せない向き（_solve_frame が使わない組になる）は選ばない
+    lever = np.linalg.norm(j, axis=-1) > p.min_lever
+    cost = np.where(lever, np.maximum(need, 0.0) ** 2 / np.maximum(ease, _EPS), np.inf)
+    best = np.argmin(cost, axis=1)
+    ok = np.isfinite(cost[np.arange(len(idx)), best])
+    n, pen = n.copy(), pen.copy()
+    sel = idx[ok]
+    n[sel] = cand[ok, best[ok]]
+    pen[sel] = need[ok, best[ok]] - p.tol
+    return n, pen
 
 
 def _solve_frame(Y, O, R, Q, p, goal=None, ignore=None):
@@ -299,6 +369,12 @@ def _solve_frame(Y, O, R, Q, p, goal=None, ignore=None):
         if (dist <= _EPS).any():   # 線分が交わっていて向きが決まらない
             n = np.where((dist > _EPS)[:, None], n, _perpendicular(cur, O))
         pen = R - dist
+        C = None
+        if p.prefers_depth:
+            # 回転のコスト ωᵀ M ω を |u|² にする変数 u = M^{1/2} ω で解く（ω = C u、C = M^{-1/2}）
+            lam, V = np.linalg.eigh(_metric(cur, p))
+            C = (V / np.sqrt(lam)) @ V.T
+            n, pen = _depth_normals(cp - A, d, n, pen, R, C @ C, p)
         # 肩まわりの小さな回転 ω で、最近点は ω × v 動き、組は n·(ω × v) = (v × n)·ω だけ離れる。
         # (v × n) が小さい組（肩のすぐ近く・肩から見た向きと n が平行）は肩まわりに回しても離せない
         J = _cross(cp - A, n)
@@ -309,7 +385,9 @@ def _solve_frame(Y, O, R, Q, p, goal=None, ignore=None):
         omega = target
         if use.any():
             Ju = J[use]
-            omega = target + _constrained_step(Ju, pen[use] + p.tol - Ju @ target, p.damping)
+            b = pen[use] + p.tol - Ju @ target
+            omega = target + (_constrained_step(Ju, b, p.damping) if C is None
+                              else C @ _constrained_step(Ju @ C, b, p.damping))
         step = float(np.linalg.norm(omega))
         if step < STOP_RAD:
             if pulling:
@@ -342,7 +420,8 @@ def _resolve_sequential(Y, O, R, Gp, p):
 
     Gp: (T, 3, 3) 自重する腕の親（肩）の大域回転。補正はこの座標系で次のフレームへ持ち越し、推定の姿勢へは
     1 フレームに p.return_step までしか戻さない（相手の腕が離れても、はね戻らない）。押しのけきれずに補正が
-    上限に達しても重なっている組は、離れるまで扱わない（その間は腕どうしが少しずつ通り抜ける）。
+    上限に達しても重なっている組は、離れるまで扱わない（その間は腕どうしが少しずつ通り抜ける）。奥行きを優先して
+    上限に達したときは、先に向きを区別せずに解き直す。
     戻り値: 補正 (T, 3, 3) と、扱わなかった組 (T, 9)。
     """
     T = len(Y)
@@ -358,13 +437,25 @@ def _resolve_sequential(Y, O, R, Gp, p):
         if not carried and (raw_pen[t] <= 0.0).all():
             skip[:] = False
             continue
-        if not carried and raw_pen[t].max() > DEEP_START * R.min():
-            Q[t] = _solve_deep_start(Y[t], O[t], R, Gp[t], p, skip)
-        else:
-            goal = Gp[t] @ _toward_identity(local, p.return_step) @ Gp[t].T
-            Q[t] = _solve_frame(Y[t], O[t], R, Gp[t] @ local @ Gp[t].T, p, goal, skip)
+        deep = not carried and raw_pen[t].max() > DEEP_START * R.min()
+
+        def solve(q):
+            if deep:
+                return _solve_deep_start(Y[t], O[t], R, Gp[t], q, skip)
+            goal = Gp[t] @ _toward_identity(local, q.return_step) @ Gp[t].T
+            return _solve_frame(Y[t], O[t], R, Gp[t] @ local @ Gp[t].T, q, goal, skip)
+
+        Q[t] = solve(p)
         over = _overlapping(Y[t], O[t], R, Q[t], p.tol)
-        if _angle(Q[t]) >= p.max_angle - 1e-6:
+        saturated = _angle(Q[t]) >= p.max_angle - 1e-6
+        if saturated and over.any() and p.prefers_depth:
+            # 奥行きを優先して上限まで回しても離れない: 向きを区別せずに解き直す（画像面内にも動かす）
+            Q_iso = solve(replace(p, depth_weight=1.0))
+            over_iso = _overlapping(Y[t], O[t], R, Q_iso, p.tol)
+            saturated_iso = _angle(Q_iso) >= p.max_angle - 1e-6
+            if over_iso.sum() < over.sum() or (over_iso.sum() == over.sum() and not saturated_iso):
+                Q[t], over, saturated = Q_iso, over_iso, saturated_iso
+        if saturated:
             skip = skip | over
         skip = skip & over
         ignored[t] = skip
@@ -376,18 +467,25 @@ def _solve_deep_start(Y, O, R, G, p, ignore):
     """持ち越す補正が無いのに深く重なっているフレーム（動画の最初から腕を組んでいる・急に重なった等）。
 
     推定の姿勢から離すと、離す向きによっては腕が相手の腕に絡んで大きく回す解に落ちるので、肩の座標系 G の
-    6 方向へ MAX_STEP_DEG 回した所からも解き、重なりが残らない解のうち補正の回転角が最も小さいものを選ぶ。
+    6 方向へ MAX_STEP_DEG 回した所からも解き、重なりが残らない解のうち補正の回転角が最も小さいものを選ぶ
+    （奥行き優先なら、回転角は推定の姿勢での _metric で重み付けした大きさ）。
     """
     best, best_score = None, np.inf
     starts = [np.eye(3)] + [_rotation(G @ (sign * np.deg2rad(MAX_STEP_DEG) * np.eye(3)[axis]))
                             for axis in range(3) for sign in (1.0, -1.0)]
     A = Y[0]
+    M = _metric(Y, p) if p.prefers_depth else None
     for Q0 in starts:
         Q = _solve_frame(Y, O, R, Q0, p, np.eye(3), ignore)
         cp, cq = _pairs(A + (Y - A) @ Q.T, O)
         pen = np.where(ignore, -np.inf, R - np.linalg.norm(cp - cq, axis=-1))
         residual = max(0.0, float(pen.max()) - p.tol)
-        score = _angle(Q) + 100.0 * residual / p.min_lever   # 重なりが残る解は選ばない
+        if M is None:
+            size = _angle(Q)
+        else:
+            rv = _rotvec(Q)
+            size = float(np.sqrt(rv @ M @ rv))
+        score = size + 100.0 * residual / p.min_lever   # 重なりが残る解は選ばない
         if score < best_score:
             best, best_score = Q, score
     return best
@@ -405,12 +503,26 @@ def _resolve_residual(Y, O, R, Q, ignored, p):
     return Q
 
 
-def resolve_arm_collisions(skel, rt, glob_rot, local, cfg, unit, fps):
+def _shift(Y, Y_after, axis):
+    """(T,) × 2 補正で腕の点（ひじ・手首・手の先）が動いた距離の最大: 画像面内（axis に垂直）と奥行き（axis 沿い）。"""
+    move = Y_after[:, 1:] - Y[:, 1:]
+    depth = move @ axis
+    image = np.linalg.norm(move - depth[..., None] * axis, axis=-1)
+    return image.max(-1), np.abs(depth).max(-1)
+
+
+def resolve_arm_collisions(skel, rt, glob_rot, local, cfg, unit, fps, depth_axis=None):
     """ステージ9a。local（Retargeter.local_quats の結果）の自重する側の腕ボーンの回転を直した dict と、
-    ArmCollisionResult を返す。glob_rot: SMPL の大域回転 (T, J, 3, 3)。"""
+    ArmCollisionResult を返す。glob_rot: SMPL の大域回転 (T, J, 3, 3)。depth_axis: カメラの奥行きの軸
+    （内部座標。depth.depth_axis。None なら Z 軸）。"""
     mode = str(cfg.mode)
     if mode not in MODES:
         raise ValueError(f'arm_collision.mode は {" / ".join(MODES)} のいずれかです: {mode}')
+    depth_cost = float(cfg.depth_cost)
+    if not 0.0 < depth_cost <= 1.0:
+        raise ValueError(f'arm_collision.depth_cost は 0 より大きく 1 以下で指定してください: {cfg.depth_cost}')
+    axis = np.array([0.0, 0.0, 1.0]) if depth_axis is None else np.asarray(depth_axis, np.float64)
+    axis = axis / np.linalg.norm(axis)
     T = len(glob_rot)
     model = arm_model(skel, cfg, unit)
     glob = rt.global_matrices(glob_rot)
@@ -418,7 +530,7 @@ def resolve_arm_collisions(skel, rt, glob_rot, local, cfg, unit, fps):
     before = overlap_depth(pts[:, 0], pts[:, 1], model.radius[0], model.radius[1])
     if mode == 'none' or T == 0:
         return local, ArmCollisionResult(mode, -1, model.radius, model.source, np.zeros(T),
-                                         before, before.copy())
+                                         before, before.copy(), np.zeros(T), np.zeros(T), depth_cost)
 
     y = SIDES.index('左') if mode == 'left' else SIDES.index('右')
     o = 1 - y
@@ -426,7 +538,8 @@ def resolve_arm_collisions(skel, rt, glob_rot, local, cfg, unit, fps):
     Y, O = pts[:, y], pts[:, o]
     R = model.radius[y][PAIR_Y] + model.radius[o][PAIR_O] + float(cfg.margin_m) * unit
     p = _Params(np.deg2rad(float(cfg.max_deg)), MIN_LEVER_M * unit, TOLERANCE_M * unit,
-                (DAMPING_M * unit) ** 2, np.deg2rad(float(cfg.return_deg_per_s)) / fps)
+                (DAMPING_M * unit) ** 2, np.deg2rad(float(cfg.return_deg_per_s)) / fps,
+                axis, depth_cost ** 2)
     # 補正は肩の親（キーを打つ祖先 = 肩）の座標系で持ち越し・ならす（体が回っても向きが変わらないように）
     parent = rt.keyed_parent[arm]
     Gp = glob[parent] if parent is not None else np.tile(np.eye(3), (T, 1, 1))
@@ -443,4 +556,5 @@ def resolve_arm_collisions(skel, rt, glob_rot, local, cfg, unit, fps):
         local[arm] = quat.make_continuous(quat.mul(q_local, local[arm]))
     Y_after = Y[:, :1] + np.einsum('tab,tkb->tka', Q, Y - Y[:, :1])
     after = overlap_depth(Y_after, O, model.radius[y], model.radius[o])
-    return local, ArmCollisionResult(mode, y, model.radius, model.source, angle, before, after)
+    return local, ArmCollisionResult(mode, y, model.radius, model.source, angle, before, after,
+                                     *_shift(Y, Y_after, axis), depth_cost)
