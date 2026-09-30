@@ -285,6 +285,25 @@ def test_elbow_bend_limits():
     assert ((0.0 <= flex) & (flex <= 150.0)).all()
 
 
+def test_elbow_returns_when_the_other_arm_moves_away():
+    """重なったあと相手の腕が離れていくと、ひじの曲げも肩の回転も推定の姿勢へ戻る（どの組も離す必要の無い一歩でも
+    解ける。以前はここで一歩の変数の数（肩だけ 3・ひじも 4）が食い違って止まった）。"""
+    np.testing.assert_allclose(ac._constrained_step(np.ones((2, 4)), np.array([-1.0, -2.0]), 0.1), np.zeros(4))
+    T = 60
+    Y = np.tile(np.array(ARMS['cross'][0]), (T, 1, 1))
+    O = np.tile(np.array(ARMS['cross'][1]), (T, 1, 1))
+    O[:, 1:, 1] -= np.clip(np.arange(T) - 10, 0, None)[:, None] * 0.01   # 11 フレーム目から相手の前腕が下へ離れる
+    R = ARM_RADIUS[ac.PAIR_Y] + ARM_RADIUS[ac.PAIR_O] + 0.005
+    u, f = Y[0, 1] - Y[0, 0], Y[0, 2] - Y[0, 1]
+    b = np.tile(np.cross(u, f) / np.linalg.norm(np.cross(u, f)), (T, 1))
+    Q, bend, _, _ = ac._resolve_sequential(Y, O, R, np.tile(np.eye(3), (T, 1, 1)), _params(depth_cost=0.5),
+                                           ac._elbows(Y, b, _ElbowCfg()))
+    fixed = ac._pose_all(Y, Q, bend, b)
+    assert (ac.overlap_depth(fixed, O, ARM_RADIUS, ARM_RADIUS) < 1e-3).all()
+    assert np.rad2deg(np.abs(bend[5])) > 5.0                     # 重なっている間はひじを曲げ伸ばしし
+    assert np.rad2deg(np.abs(bend[-1])) < 1e-3 and ac._angle(Q[-1]) < 1e-6   # 離れたら推定の姿勢に戻る
+
+
 def test_corrected_rotations_give_the_resolved_arms(body_model):
     """補正した腕・ひじのローカル回転（VMD に入る回転）から FK で求めた腕の位置が、ステージ9a の解いた位置と一致して
     重ならない（ステージ9h で直した腕の姿勢も含めて判定する）。"""
