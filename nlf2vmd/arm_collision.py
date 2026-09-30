@@ -21,8 +21,10 @@
   カメラの奥行き方向の位置はぶれる。そこで、腕（ひじ・手首・手の先）をカメラの奥行き方向へ動かす回転を安く見積もり
   （肩まわりの回転のコストのうち、奥行き方向へ動かす分を depth_cost² 倍にする）、画像面内の動きを自重して前後へずらす。
   重なっている組の離す向きも、最近点を結ぶ向きと奥行きの軸の間から、そのコストで最も安く離せる向きを選ぶ（横に
-  並んで重なった腕も、前後へずらして離せる）。前後の順（どちらの腕が手前か）は推定のまま。奥行きを優先して回転角が
-  max_deg に達しても離れないフレームは、向きを区別せずに（depth_cost = 1 として）解き直す
+  並んで重なった腕も、前後へずらして離せる）。前後の順（どちらの腕が手前か）は推定のまま。画像面内と奥行きの動きは
+  1 つのコストで同時に決めるので、腕は奥行きを主に、画像面内にも少し動く（depth_cost の比で配分される）。奥行きを
+  優先して回転角が max_deg に達しても離れないフレームは、そのフレームだけ depth_cost を 1（向きを区別しない）へ向けて
+  離れるところまで弱める（画像面内の動きを必要な分だけ増やす）
 * 補正の回転を肩の親（肩ボーン）の座標系で時間方向にならしてから、ならして浅くなった重なりをもう一度離す
 """
 from dataclasses import dataclass, replace
@@ -50,6 +52,7 @@ MIN_VERTICES = 20             # 半径を測る頂点がこれより少ない部
 DEEP_START = 0.5              # 持ち越す補正が無いのに、半径の和のこの割合より深く重なっていれば別の向きからも解く
 DEPTH_SAMPLES = 13            # 奥行き優先: 離す向きの候補の数（最近点を結ぶ向きから奥行きの軸までの 90 度を等分）
 SAME_DEPTH = 0.02             # 奥行き優先: 離す向きの奥行きの成分がこれより小さい（最近点がほぼ同じ奥行き）なら前後どちらへも離せる
+RELAX_STEPS = 4               # 奥行き優先で上限に達したとき、depth_cost を 1 へ向けて弱める二分法の回数
 OVERLAP_TOL_M = 0.005         # 評価指標: カプセルがこれより深く重なったフレームを「重なり」と数える
 _EPS = 1e-9
 
@@ -75,6 +78,12 @@ class ArmCollisionResult:
     shift_image: np.ndarray = None
     shift_depth: np.ndarray = None
     depth_cost: float = 1.0
+    depth_cost_used: np.ndarray = None   # (T,) フレームごとに使った depth_cost（上限に達して弱めたフレームは大きい）
+
+    @property
+    def relaxed_frames(self):
+        """奥行きの優先を弱めたフレーム数。"""
+        return 0 if self.depth_cost_used is None else int((self.depth_cost_used > self.depth_cost + 1e-9).sum())
 
     def overlap_frames(self, tol):
         """(処理前, 処理後) カプセルが tol [MMD 単位] より深く重なっているフレーム数。"""
@@ -421,14 +430,15 @@ def _resolve_sequential(Y, O, R, Gp, p):
     Gp: (T, 3, 3) 自重する腕の親（肩）の大域回転。補正はこの座標系で次のフレームへ持ち越し、推定の姿勢へは
     1 フレームに p.return_step までしか戻さない（相手の腕が離れても、はね戻らない）。押しのけきれずに補正が
     上限に達しても重なっている組は、離れるまで扱わない（その間は腕どうしが少しずつ通り抜ける）。奥行きを優先して
-    上限に達したときは、先に向きを区別せずに解き直す。
-    戻り値: 補正 (T, 3, 3) と、扱わなかった組 (T, 9)。
+    上限に達したときは、先に奥行きの優先を弱めて解き直す（_relax_depth）。
+    戻り値: 補正 (T, 3, 3) と、扱わなかった組 (T, 9) と、フレームごとに使った depth_weight (T,)。
     """
     T = len(Y)
     cp, cq = _pairs(Y, O)
     raw_pen = R - np.linalg.norm(cp - cq, axis=-1)   # 推定の姿勢のままでの重なり
     Q = np.tile(np.eye(3), (T, 1, 1))
     ignored = np.zeros((T, len(R)), bool)
+    weight = np.full(T, p.depth_weight)
     local = np.eye(3)                   # 前のフレームの補正（肩の座標系）
     skip = np.zeros(len(R), bool)       # 扱わない組
     for t in range(T):
@@ -445,22 +455,48 @@ def _resolve_sequential(Y, O, R, Gp, p):
             goal = Gp[t] @ _toward_identity(local, q.return_step) @ Gp[t].T
             return _solve_frame(Y[t], O[t], R, Gp[t] @ local @ Gp[t].T, q, goal, skip)
 
-        Q[t] = solve(p)
-        over = _overlapping(Y[t], O[t], R, Q[t], p.tol)
-        saturated = _angle(Q[t]) >= p.max_angle - 1e-6
+        Q[t], over, saturated = _attempt(solve, Y[t], O[t], R, p)
         if saturated and over.any() and p.prefers_depth:
-            # 奥行きを優先して上限まで回しても離れない: 向きを区別せずに解き直す（画像面内にも動かす）
-            Q_iso = solve(replace(p, depth_weight=1.0))
-            over_iso = _overlapping(Y[t], O[t], R, Q_iso, p.tol)
-            saturated_iso = _angle(Q_iso) >= p.max_angle - 1e-6
-            if over_iso.sum() < over.sum() or (over_iso.sum() == over.sum() and not saturated_iso):
-                Q[t], over, saturated = Q_iso, over_iso, saturated_iso
+            Q[t], over, saturated, weight[t] = _relax_depth(solve, Y[t], O[t], R, p, (Q[t], over, saturated))
         if saturated:
             skip = skip | over
         skip = skip & over
         ignored[t] = skip
         local = Gp[t].T @ Q[t] @ Gp[t]
-    return Q, ignored
+    return Q, ignored, weight
+
+
+def _attempt(solve, Y, O, R, q):
+    """solve(q) で解いた補正と、重なっている組 (9,) と、回転角が上限に達したか。"""
+    Q = solve(q)
+    return Q, _overlapping(Y, O, R, Q, q.tol), _angle(Q) >= q.max_angle - 1e-6
+
+
+def _relax_depth(solve, Y, O, R, p, first):
+    """奥行きを優先して回転角が上限に達しても離れないフレーム: depth_cost を 1（向きを区別しない）へ向けて、離れる
+    ところまで弱める（二分法。奥行きの優先をなるべく残し、画像面内の動きを必要な分だけ増やす）。
+
+    solve(q): _Params q で解いた補正 / first: p で解いた (補正, 重なっている組, 上限に達したか)。
+    戻り値: (補正, 重なっている組, 上限に達したか, 使った depth_weight)。1 でも離れなければ、重なっている組の少ない方。
+    """
+    def failed(res):
+        return res[2] and res[1].any()
+
+    lo, hi = float(np.sqrt(p.depth_weight)), 1.0
+    iso = _attempt(solve, Y, O, R, replace(p, depth_weight=1.0))
+    if failed(iso):
+        if iso[1].sum() < first[1].sum():
+            return (*iso, 1.0)
+        return (*first, p.depth_weight)
+    best = (*iso, 1.0)
+    for _ in range(RELAX_STEPS):
+        mid = 0.5 * (lo + hi)
+        res = _attempt(solve, Y, O, R, replace(p, depth_weight=mid * mid))
+        if failed(res):
+            lo = mid
+        else:
+            hi, best = mid, (*res, mid * mid)
+    return best
 
 
 def _solve_deep_start(Y, O, R, G, p, ignore):
@@ -491,15 +527,16 @@ def _solve_deep_start(Y, O, R, G, p, ignore):
     return best
 
 
-def _resolve_residual(Y, O, R, Q, ignored, p):
+def _resolve_residual(Y, O, R, Q, ignored, p, weight):
     """2 回目: ならした補正 Q (T, 3, 3) で重なるフレームだけ、重ならないところまで回す（戻さない）。
-    ignored: (T, 9) 1 回目で扱わなかった組。"""
+    ignored: (T, 9) 1 回目で扱わなかった組 / weight: (T,) 1 回目で使った depth_weight。"""
     A = Y[:, :1]
     cp, cq = _pairs(A + np.einsum('tab,tkb->tka', Q, Y - A), O)
     touching = (np.linalg.norm(cp - cq, axis=-1) < R) & ~ignored
     Q = Q.copy()
     for t in np.flatnonzero(touching.any(1)):
-        Q[t] = _solve_frame(Y[t], O[t], R, Q[t], p, ignore=ignored[t])
+        q = p if weight[t] == p.depth_weight else replace(p, depth_weight=float(weight[t]))
+        Q[t] = _solve_frame(Y[t], O[t], R, Q[t], q, ignore=ignored[t])
     return Q
 
 
@@ -530,7 +567,8 @@ def resolve_arm_collisions(skel, rt, glob_rot, local, cfg, unit, fps, depth_axis
     before = overlap_depth(pts[:, 0], pts[:, 1], model.radius[0], model.radius[1])
     if mode == 'none' or T == 0:
         return local, ArmCollisionResult(mode, -1, model.radius, model.source, np.zeros(T),
-                                         before, before.copy(), np.zeros(T), np.zeros(T), depth_cost)
+                                         before, before.copy(), np.zeros(T), np.zeros(T), depth_cost,
+                                         np.full(T, depth_cost))
 
     y = SIDES.index('左') if mode == 'left' else SIDES.index('右')
     o = 1 - y
@@ -544,10 +582,10 @@ def resolve_arm_collisions(skel, rt, glob_rot, local, cfg, unit, fps, depth_axis
     parent = rt.keyed_parent[arm]
     Gp = glob[parent] if parent is not None else np.tile(np.eye(3), (T, 1, 1))
     Gp_t = np.swapaxes(Gp, -1, -2)
-    Q, ignored = _resolve_sequential(Y, O, R, Gp, p)
+    Q, ignored, weight = _resolve_sequential(Y, O, R, Gp, p)
     rv = quat.to_rotvec(quat.from_matrix(Gp_t @ Q @ Gp))
     rv = filters.gaussian_time(rv, float(cfg.smooth_sec) * fps)
-    Q = _resolve_residual(Y, O, R, Gp @ quat.to_matrix(quat.from_rotvec(rv)) @ Gp_t, ignored, p)
+    Q = _resolve_residual(Y, O, R, Gp @ quat.to_matrix(quat.from_rotvec(rv)) @ Gp_t, ignored, p, weight)
 
     q_local = quat.from_matrix(Gp_t @ Q @ Gp)
     angle = np.rad2deg(np.linalg.norm(quat.to_rotvec(q_local), axis=-1))
@@ -557,4 +595,4 @@ def resolve_arm_collisions(skel, rt, glob_rot, local, cfg, unit, fps, depth_axis
     Y_after = Y[:, :1] + np.einsum('tab,tkb->tka', Q, Y - Y[:, :1])
     after = overlap_depth(Y_after, O, model.radius[y], model.radius[o])
     return local, ArmCollisionResult(mode, y, model.radius, model.source, angle, before, after,
-                                     *_shift(Y, Y_after, axis), depth_cost)
+                                     *_shift(Y, Y_after, axis), depth_cost, np.sqrt(weight))

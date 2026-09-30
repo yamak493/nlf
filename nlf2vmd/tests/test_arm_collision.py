@@ -84,7 +84,7 @@ def test_yielding_arm_stays_on_its_side_when_the_estimate_passes_through():
     """推定の左の前腕が右の前腕の前から後ろへ通り抜けても、自重する左腕は来た側（前）に留まる。"""
     T = 60
     Y, O, R = _crossing(T, 0.15, -0.1)
-    Q, ignored = ac._resolve_sequential(Y, O, R, np.tile(np.eye(3), (T, 1, 1)), _params())
+    Q, ignored, _ = ac._resolve_sequential(Y, O, R, np.tile(np.eye(3), (T, 1, 1)), _params())
     assert not ignored.any()
     fixed = _apply(Y, Q)
     cp, cq = ac._pairs(Y, O)
@@ -102,7 +102,7 @@ def test_yielding_arm_passes_through_gradually_beyond_the_limit():
     T = 90
     Y, O, R = _crossing(T, 0.15, -0.6)
     p = _params()
-    Q, ignored = ac._resolve_sequential(Y, O, R, np.tile(np.eye(3), (T, 1, 1)), p)
+    Q, ignored, _ = ac._resolve_sequential(Y, O, R, np.tile(np.eye(3), (T, 1, 1)), p)
     assert ignored.any()
     angle = np.array([ac._angle(q) for q in Q])
     assert angle.max() <= p.max_angle + 1e-6
@@ -128,7 +128,7 @@ def _solve_stacked(depth_cost, max_deg=45.0, rotation=np.eye(3)):
     Y, O, R = _stacked(T, 0.05)
     Y, O = Y @ rotation.T, O @ rotation.T
     p = _params(depth_cost=depth_cost, max_deg=max_deg, axis=rotation @ [0.0, 0.0, 1.0])
-    Q, ignored = ac._resolve_sequential(Y, O, R, np.tile(rotation, (T, 1, 1)), p)
+    Q, ignored, _ = ac._resolve_sequential(Y, O, R, np.tile(rotation, (T, 1, 1)), p)
     fixed = _apply(Y, Q)
     cp, cq = ac._pairs(fixed, O)
     overlap = (R - np.linalg.norm(cp - cq, axis=-1)).max(1)
@@ -156,19 +156,30 @@ def test_depth_cost_follows_the_given_camera_axis():
     np.testing.assert_allclose([image_r, depth_r], [image, depth], atol=1e-4)
 
 
-def test_depth_cost_falls_back_to_the_shortest_shift_at_the_limit():
-    """奥行きへずらすと max_deg を超えるときは、向きを区別せずに（最近点を結ぶ向きへ）解き直して離す。"""
+def test_depth_cost_is_relaxed_only_as_much_as_the_limit_needs():
+    """奥行きへずらすと max_deg を超えるときは、depth_cost を離れるところまで弱めて、画像面内と奥行きの両方へ
+    ずらす（向きを区別しない解へいきなり切り替えない）。"""
     Q1, _, _, image1, depth1 = _solve_stacked(1.0)
-    limit = np.rad2deg(ac._angle(Q1[-1])) + 0.5     # 最近点を結ぶ向きへずらすなら上限に届かない
+    _, _, _, image_d, depth_d = _solve_stacked(0.3)
+    limit = np.rad2deg(ac._angle(Q1[-1])) + 0.5        # 最近点を結ぶ向きへずらすなら上限に届かない
     Y, O, R = _stacked(1, 0.05)
     p = _params(depth_cost=0.3, max_deg=limit)
     Q = ac._solve_frame(Y[0], O[0], R, np.eye(3), p, np.eye(3))
-    assert ac._angle(Q) >= p.max_angle - 1e-6          # 奥行き優先だけでは上限に達して
+    assert ac._angle(Q) >= p.max_angle - 1e-6          # depth_cost 0.3 のままでは上限に達して
     assert ac._overlapping(Y[0], O[0], R, Q, p.tol).any()   # 離れない
-    _, ignored, overlap, image, depth = _solve_stacked(0.3, max_deg=limit)
+
+    T = 10
+    Y, O, R = _stacked(T, 0.05)
+    Q, ignored, weight = ac._resolve_sequential(Y, O, R, np.tile(np.eye(3), (T, 1, 1)), p)
+    fixed = _apply(Y, Q)
+    cp, cq = ac._pairs(fixed, O)
     assert not ignored.any()
-    assert (overlap < 1e-3).all()
-    np.testing.assert_allclose([image, depth], [image1, depth1], atol=1e-6)
+    assert ((R - np.linalg.norm(cp - cq, axis=-1)).max(1) < 1e-3).all()
+    assert all(ac._angle(q) <= p.max_angle + 1e-6 for q in Q)
+    assert (0.3 ** 2 < weight).all() and (weight < 1.0).all()   # 弱めたが、向きを区別しない所までは戻さない
+    image, depth = (x[-1] for x in ac._shift(Y, fixed, p.axis))
+    assert image_d < image < image1                    # 画像面内の動きは必要な分だけ増え
+    assert depth1 < depth < depth_d                    # 奥行きの動きも残る
 
 
 def test_depth_cost_in_the_pipeline(body_model):
@@ -177,6 +188,7 @@ def test_depth_cost_in_the_pipeline(body_model):
     r = _convert(body_model, motion, 'left')           # 既定は depth_cost 0.5
     a = r.arm_collision
     assert a.depth_cost == 0.5 and iso.depth_cost == 1.0
+    assert a.relaxed_frames == 0 and np.allclose(a.depth_cost_used, 0.5)
     assert a.overlap_frames(0.005 * r.scale)[1] == 0
     assert a.shift_image.max() < iso.shift_image.max()
     assert a.shift_depth.max() > iso.shift_depth.max()
