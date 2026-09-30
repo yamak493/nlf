@@ -23,7 +23,7 @@ from .body_model import ANKLES, BodyModel, compute_kinematics, forward_kinematic
 from .center import ReachGeometry, stabilize_center
 from .config import Config, load_config
 from .contact import detect_contacts
-from .contacts import resolve_contacts
+from .contacts import BODY_PART_LABELS, resolve_contacts
 from .depth import depth_axis, depth_jitter, detection_speeds, reconstruct_depth
 from .floor import estimate_floor
 from .filters import frames_for_fps, runs
@@ -324,20 +324,34 @@ def log_outliers(outliers, fps, log, warn):
              '決められないので置き換えていません')
 
 
+def _contact_targets(info):
+    """ステージ9b で当たり判定をする相手（腕・体の部位）と、判定しない体の部位の文字列。"""
+    parts = info.get('body_parts', {})
+    on = [BODY_PART_LABELS[p] for p, v in parts.items() if v['enabled']]
+    off = [BODY_PART_LABELS[p] for p, v in parts.items() if not v['enabled']]
+    arm = info.get('arm_mode', 'none')
+    if arm in ('left', 'right'):
+        on.insert(0, f'腕（{MODE_LABELS[arm]}）')
+    return '・'.join(on) or 'なし', '・'.join(off)
+
+
 def log_contacts(contacts, unit, log, label='[9b]'):
     if log is None:
         return
+    on, off = _contact_targets(contacts.info)
     if not contacts.enabled:
-        log(f'{label} 腕・指と体の接触: 扱いません')
+        log(f'{label} 腕・指と体の接触: 扱いません'
+            + ('（判定する部位がありません）' if contacts.info and on == 'なし' else ''))
         return
+    skipped = f'（判定しない部位: {off}）' if off else ''
     info = contacts.info
     source = dict(rigid='PMX の剛体', mesh='PMX のメッシュ', config='標準の体格', none='なし')[
         info['body_source']]
     parts = ' / '.join(f'{k} {b}→{a}' for k, (b, a) in info['overlap_frames_by_part'].items()
                        if b or a)
     corr = info['max_correction_deg']
-    log(f'{label} 腕・指と体・相手の腕の接触（体の形: {source} {info["body_capsules"]} 個・'
-        f'{"指の各節まで" if info["fingers"] else "手は 1 本の棒"}）: 重なり '
+    log(f'{label} 腕・指と体・相手の腕の接触（判定する相手: {on}{skipped} / 体の形: {source} '
+        f'{info["body_capsules"]} 個・{"指の各節まで" if info["fingers"] else "手は 1 本の棒"}）: 重なり '
         f'{info["overlap_frames"]["before"]} → {info["overlap_frames"]["after"]} フレーム'
         + (f'（{parts}）' if parts else '')
         + f' / 補正 最大 肩 {corr["shoulder"]:.1f}・ひじ {corr["elbow"]:.1f}・手首 {corr["wrist"]:.1f} 度')
@@ -640,14 +654,20 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     log_hand_reach(reach, log)
 
     # ---- 9a. 腕どうしの貫通の防止 ----
-    local, arms = resolve_arm_collisions(skel, rt, kin.glob_rot, local, cfg.arm_collision, k, fps)
+    local, arms = resolve_arm_collisions(skel, rt, kin.glob_rot, local, cfg.arm_collision, k, fps, axis)
     n_before, n_after = arms.overlap_frames(OVERLAP_TOL_M * k)
     radius_cm = ' / '.join(f'{n} {r:.1f}' for n, r in zip(('上腕', '前腕', '手'),
                                                          arms.radius.mean(0) / k * 100.0))
     log(f'[9a] 腕どうしの貫通の防止（{MODE_LABELS[arms.mode]}）: 腕の半径 {radius_cm} cm'
         f'（{"PMX のメッシュから" if arms.radius_source == "mesh" else "設定の値"}）/ '
         f'重なり {n_before} → {n_after} フレーム'
-        + (f' / 補正 最大 {arms.correction_deg.max(initial=0.0):.1f} 度' if arms.side >= 0 else ''))
+        + (f' / 補正 最大 肩 {arms.correction_deg.max(initial=0.0):.1f}'
+           + (f'・ひじ {arms.elbow_deg.max(initial=0.0):.1f}' if arms.elbow else '（ひじは曲げない）')
+           + f' 度（腕の移動 最大 画像面内 '
+           f'{arms.shift_image.max(initial=0.0) / k * 100:.1f} cm・奥行き '
+           f'{arms.shift_depth.max(initial=0.0) / k * 100:.1f} cm。depth_cost {arms.depth_cost:g}'
+           + (f'。上限に達して奥行きの優先を弱めたフレーム {arms.relaxed_frames}' if arms.relaxed_frames else '')
+           + '）' if arms.side >= 0 else ''))
 
     # ---- 9b. 腕・手のひら・指先と、体・相手の腕の接触 ----
     # 手首は先に可動域に収めてから解く（9c。人の関節では届かない向きの手で当たり判定をしない）
@@ -735,7 +755,11 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
                            max_depth_cm={key: float(d.max(initial=0.0) / k * 100.0) for key, d in
                                          (('before', arms.depth_before),
                                           ('after', arms.depth_after))},
-                           max_correction_deg=float(arms.correction_deg.max(initial=0.0))),
+                           max_correction_deg=float(arms.correction_deg.max(initial=0.0)),
+                           elbow=arms.elbow, max_elbow_deg=float(arms.elbow_deg.max(initial=0.0)),
+                           depth_cost=arms.depth_cost, relaxed_frames=arms.relaxed_frames,
+                           max_shift_cm={key: float(d.max(initial=0.0) / k * 100.0) for key, d in
+                                         (('image', arms.shift_image), ('depth', arms.shift_depth))}),
         warnings=warns)
 
     if cfg.diagnostics.enabled:

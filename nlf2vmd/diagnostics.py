@@ -400,11 +400,11 @@ def save_plots(r, out_dir):
         paths['hand_reach'] = out_dir / 'hand_reach.png'
         fig.savefig(paths['hand_reach'], dpi=110)
 
-    # 2e. 腕どうしの貫通の防止（左右の腕のカプセルの重なりと、自重する腕に掛けた補正角）
+    # 2e. 腕どうしの貫通の防止（左右の腕のカプセルの重なりと、自重する腕に掛けた補正角・腕の移動量（画像面内 / 奥行き））
     if r.arm_collision is not None:
         a = r.arm_collision
-        fig = Figure(figsize=(12, 4))
-        ax = fig.subplots()
+        fig = Figure(figsize=(12, 6.5))
+        ax, ax3 = fig.subplots(2, 1, sharex=True, gridspec_kw=dict(height_ratios=[3, 2]))
         tol = OVERLAP_TOL_M * 100.0
         top = max(tol, 1.1 * float(a.depth_before.max(initial=0.0)) * cm)
         ax.axhspan(tol, top, color='tab:red', alpha=0.08, lw=0)
@@ -416,9 +416,12 @@ def save_plots(r, out_dir):
                                                 a.depth_after.min(initial=0.0))) * cm))
         ax2 = ax.twinx()
         ax2.plot(frames, a.correction_deg, color='tab:purple', lw=1.2, label='correction of the '
-                 'yielding arm [deg]')
+                 'yielding arm (shoulder) [deg]')
+        if a.elbow:
+            ax2.plot(frames, a.elbow_deg, color='tab:green', lw=1.2, label='bend of the elbow [deg]')
         ax2.set_ylabel('correction [deg]')
-        ax2.set_ylim(0.0, max(10.0, 1.2 * float(a.correction_deg.max(initial=0.0))))
+        ax2.set_ylim(0.0, max(10.0, 1.2 * float(max(a.correction_deg.max(initial=0.0),
+                                                     a.elbow_deg.max(initial=0.0)))))
         before, after = a.overlap_frames(OVERLAP_TOL_M * k)
         radius = a.radius.mean(0) * cm
         yields = {0: 'left arm yields', 1: 'right arm yields'}.get(a.side, 'no correction')
@@ -426,9 +429,17 @@ def save_plots(r, out_dir):
                      f'radius upper / fore / hand '
                      f'{radius[0]:.1f} / {radius[1]:.1f} / {radius[2]:.1f} cm ({a.radius_source})',
                      fontsize=10)
-        ax.set_xlabel('frame')
-        lines = ax.get_lines()[:2] + ax2.get_lines()[:1]
+        lines = ax.get_lines()[:2] + ax2.get_lines()
         ax.legend(lines, [ln.get_label() for ln in lines], loc='upper right', fontsize=8)
+        ax3.plot(frames, a.shift_image * cm, color='tab:blue', lw=1.2, label='image plane')
+        ax3.plot(frames, a.shift_depth * cm, color='tab:orange', lw=1.2, label='depth (camera axis)')
+        ax3.set_ylabel('shift of the yielding arm [cm]')
+        ax3.set_ylim(bottom=0.0)
+        ax3.set_title(f'largest shift of the elbow / wrist / hand tip by the correction '
+                      f'(depth_cost {a.depth_cost:g}: moving in depth costs {a.depth_cost:g} x the image plane)',
+                      fontsize=9)
+        ax3.legend(loc='upper right', fontsize=8)
+        ax3.set_xlabel('frame')
         fig.tight_layout()
         paths['arm_collision'] = out_dir / 'arm_collision.png'
         fig.savefig(paths['arm_collision'], dpi=110)
