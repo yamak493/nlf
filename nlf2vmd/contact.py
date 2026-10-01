@@ -36,6 +36,25 @@ def clean_flags(flags, fill_gap, min_len):
     return flags
 
 
+def without_frames(contact, mask, cfg):
+    """mask のフレームで、どちらの足も接地していないことにした ContactResult。
+
+    ステージ6a の滞空（ground.flight）を渡す。宙にある体はどの足も床に着いていないが、接地判定のヒステリシス
+    （終了の高さ 5cm）で、踏み切り・着地の数フレームは接地が続いていることがある。除いた後に短い隙間を埋め、
+    短い接地区間を捨て直す（clean_flags）。
+    """
+    mask = np.asarray(mask, bool)
+    if not mask.any():
+        return contact
+    flags = np.array(contact.flags, bool, copy=True)
+    flags[mask] = False
+    for foot in range(flags.shape[1]):
+        flags[:, foot] = clean_flags(flags[:, foot], int(cfg.fill_gap_frames),
+                                     int(cfg.min_contact_frames)) & ~mask
+    return ContactResult(flags, [runs(flags[:, f]) for f in range(flags.shape[1])], contact.heights,
+                         contact.speeds)
+
+
 def detect_contacts(points, fps, cfg, unit=1.0, speeds=None, valid=None):
     """points: (T, 2 足, P 点, 3)。床が y=0 の座標。しきい値 [m] には unit を掛けて使う。
 

@@ -22,7 +22,7 @@ from .arm_collision import MODE_LABELS, OVERLAP_TOL_M, resolve_arm_collisions
 from .body_model import ANKLES, BodyModel, compute_kinematics, forward_kinematics, rest_info
 from .center import ReachGeometry, stabilize_center, supporting_legs
 from .config import Config, load_config
-from .contact import detect_contacts
+from .contact import detect_contacts, without_frames
 from .contacts import BODY_PART_LABELS, resolve_contacts
 from .depth import depth_axis, depth_jitter, detection_speeds, reconstruct_depth
 from .floor import estimate_floor
@@ -600,6 +600,10 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
     # 接地判定の高さを最後の体の高さにする（足ＩＫの床への吸着は、同じ体の「足首 − 足裏」の高さを使う。
     # 判定した体のままだと、最後の接地の拘束・奥行きの補正で動いた分だけ、接地中の足が浮く・埋まる）
     contact = replace(contact, heights=np.asarray(kin.contact_points)[..., 1])
+    # ジャンプの滞空（体が宙にあるか）はステージ6a だけが決める。以降のステージ（足ＩＫ・センター・接地優先）は
+    # 判定し直さずに、この接地と flight を使う（接地判定のヒステリシスで、滞空の最初・最後の数フレームに残った接地を除く）
+    flight = np.asarray(ground.flight, bool)
+    contact = without_frames(contact, flight, cfg.contact)
     if ground.enabled:
         log(f'[6a] 接地の拘束: 上下の補正 {-ground.offset.max() / k * 100:.1f} 〜 '
             f'{-ground.offset.min() / k * 100:.1f} cm / ジャンプとして残した区間 '
@@ -636,14 +640,16 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
 
     # ---- 8. センターの安定化 ----
     # 届く高さは体を支えている脚（接地している脚と、足裏が床の近くにある脚）だけで判定する（宙にある遊脚に
-    # 届かせるために体全体を下げない）
+    # 届かせるために体全体を下げない）。ジャンプの滞空のフレームは、どちらの脚も支えていない。
+    # 上下の平滑化は滞空をまたがない（跳んだ高さを削らない）
     geom = ReachGeometry.from_skeleton(skel)
     support = supporting_legs(contact.flags, mmd_sole_heights(skel, ik),
-                              float(cfg.contact.exit_height_m) * k, int(cfg.foot_ik.blend_frames))
+                              float(cfg.contact.exit_height_m) * k, int(cfg.foot_ik.blend_frames),
+                              flight)
     center = stabilize_center(kin_raw.root_pos, kin.root_pos, pelvis_rest,
                               kin.joints[:, ANKLES], ik, contact, geom,
                               rt.global_matrix('下半身', kin.glob_rot), fps, k, cfg.center,
-                              depth.enabled, legs=support)
+                              depth.enabled, legs=support, flight=flight)
     log(f'[8] センター（モード {center.mode}）: 体を支えている脚の伸び切り {center.exceed_before} → '
         f'{center.exceed_after} フレーム（宙にある脚は判定しない）')
     if center.exceed_after:

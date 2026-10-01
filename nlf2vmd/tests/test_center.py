@@ -107,6 +107,36 @@ def test_supporting_legs():
     legs = supporting_legs(flags, sole, 0.05, 2)
     assert legs[3:10, 0].all() and not legs[:3, 0].any() and not legs[10:, 0].any()
     assert legs[15, 1] and legs[:, 1].sum() == 1
+    # ジャンプの滞空（ステージ6a）のフレームは、接地の前後へ広げた分も、足裏が床の近くの脚も使わない
+    flight = np.zeros(20, bool)
+    flight[8:16] = True
+    legs = supporting_legs(flags, sole, 0.05, 2, flight)
+    assert legs[3:8, 0].all() and not legs[8:, 0].any() and not legs[:, 1].any()
+
+
+def test_split_flight_keeps_the_ballistic_height():
+    """滞空の区間は、前後を結ぶ直線（地上の動き）と放物線（跳んだ高さ）に分ける。地上の動きを平滑化しても、
+    跳んだ高さは削れない。"""
+    from nlf2vmd.center import split_flight
+    T = 60
+    y = np.linspace(0.0, 0.02, T)                      # ゆっくり上がる地上の動き
+    flight = np.zeros(T, bool)
+    flight[20:32] = True                               # フレーム 19〜32 の間で放物線（両端で 0）
+    tau = np.arange(14.0)
+    y[19:33] += 0.0015 * tau * (13 - tau)              # 高さ約 6cm
+    ground, jump = split_flight(y, flight)
+    np.testing.assert_allclose(ground + jump, y, atol=1e-12)
+    np.testing.assert_allclose(ground, np.linspace(0.0, 0.02, T), atol=1e-12)
+    assert (jump[:19] == 0).all() and (jump[33:] == 0).all()
+    # 滞空が無ければそのまま。先頭・末尾にかかる滞空は分けない
+    g0, j0 = split_flight(y, None)
+    np.testing.assert_array_equal(g0, y)
+    assert not j0.any()
+    edge = np.zeros(T, bool)
+    edge[:5] = True
+    g1, j1 = split_flight(y, edge)
+    np.testing.assert_array_equal(g1, y)
+    assert not j1.any()
 
 
 def _kick(peak_deg, fps=30.0, T=120):
@@ -144,3 +174,36 @@ def test_kicking_leg_does_not_lower_the_body():
         # 接地優先（両足を床に着ける）も、移動なしも同じ判定で作れる
         variant_tracks(r, 'locked', log=None)
         variant_tracks(r, 'no_move', log=None)
+
+
+def _jump(duration, height, seed=0):
+    from nlf2vmd.synthetic import add_joint_noise, add_jump, synthetic_walk
+    m = add_jump(synthetic_walk(180, 30.0, speed=0.0, lift=0.0), 2.0, duration, height)
+    return add_joint_noise(m, {j: 2.0 for j in range(24)}, seed=seed), m['airborne']
+
+
+def test_jump_height_is_kept():
+    """両足で跳んだ高さを、センターの平滑化と届く高さのクランプで削らない（どちらのモードも）。
+    以前は、滞空をまたいだ平滑化で踏み切りの前・着地の後へ広がった上昇を、床にある足ＩＫに届かないとしてクランプが
+    下げ、0.3 秒・8cm の跳びは 23%、0.4 秒・15cm は 53% しか残らなかった（モードB は、接地していない区間に重力の
+    放物線を描き直すので 132〜151% に跳び上がることもあった）。"""
+    from nlf2vmd.pipeline import convert
+    from nlf2vmd.synthetic import synthetic_body_model
+    from nlf2vmd.variants import no_move_motion
+    bm = synthetic_body_model()
+    for duration, height in ((0.3, 0.08), (0.4, 0.15)):
+        m, airborne = _jump(duration, height)
+        for mode in ('A', 'B'):
+            r = convert(m, None, body_model=bm, log=None,
+                        overrides=['diagnostics.enabled=false', f'center.mode={mode}'])
+            y = r.center.delta[:, 1] / r.scale
+            kept = (y.max() - np.median(y[:40])) / height
+            assert 0.85 < kept < 1.1, (duration, mode, kept)
+            # 滞空（ステージ6a）のフレームは、接地にも、体を支える脚にもしない
+            flight = np.asarray(r.ground.flight, bool)
+            assert flight.sum() >= 0.8 * airborne.sum()
+            assert not r.contact.flags[flight].any() and not r.center.legs[flight].any()
+            assert r.center.exceed_after == 0
+            # 移動なしも同じ高さを残す
+            nm, _, _ = no_move_motion(r)
+            assert abs((nm[:, 1].max() - np.median(nm[:40, 1])) / r.scale / height - kept) < 0.05

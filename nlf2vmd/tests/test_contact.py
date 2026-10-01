@@ -1,7 +1,7 @@
 """接地判定: 接地区間が既知の合成歩行データで、推定区間が正解と ±1 フレーム以内で一致すること。"""
 import numpy as np
 
-from nlf2vmd.contact import clean_flags, hysteresis
+from nlf2vmd.contact import ContactResult, clean_flags, hysteresis, without_frames
 from nlf2vmd.filters import runs
 
 
@@ -41,3 +41,23 @@ def test_clean_flags_fills_short_gaps_then_drops_short_contacts():
     out = clean_flags(f, fill_gap=2, min_len=4)
     # 2 フレームの隙間は埋まって 0〜7 が 1 区間、3 フレーム離れた長さ 2 の区間は捨てられる
     np.testing.assert_array_equal(out, [1] * 8 + [0] * 8)
+
+
+def test_without_frames_clears_contact_in_flight():
+    """ジャンプの滞空（ステージ6a）のフレームは、接地判定のヒステリシスで残った接地も除く。除いた後に残る短い接地は捨てる。"""
+    from nlf2vmd import load_config
+    cfg = load_config().contact
+    flags = np.zeros((40, 2), bool)
+    flags[:12, 0] = True          # 踏み切りの 2 フレーム目まで接地が続いた
+    flags[24:, 0] = True
+    flags[8:11, 1] = True          # 滞空で切ると 2 フレームだけ残る
+    flags[20:, 1] = True
+    zeros = np.zeros((40, 2, 2))
+    contact = ContactResult(flags, [runs(flags[:, f]) for f in range(2)], zeros, zeros)
+    flight = np.zeros(40, bool)
+    flight[10:22] = True
+    out = without_frames(contact, flight, cfg)
+    assert not out.flags[flight].any()
+    assert out.segments[0] == [(0, 9), (24, 39)]
+    assert out.segments[1] == [(22, 39)]   # 8〜9 の 2 フレームは min_contact_frames より短いので捨てる
+    assert without_frames(contact, np.zeros(40, bool), cfg) is contact

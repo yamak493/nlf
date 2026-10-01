@@ -197,9 +197,8 @@ center:
     z_raw: {min_cutoff: 0.5, beta: 0.3}   # depth.reconstruct: false のときの Z（推定の奥行きのぶれがそのまま残るので最も強く）
   d_cutoff: 1.0
   zero_phase: true
+  # ジャンプの滞空はステージ6a（ground.*）が決め、上下の平滑化は滞空をまたがない（どちらのモードも）
   mode_b:
-    max_flight_sec: 0.6     # 両足が離れた区間がこれ以下なら上下を放物線で補間（超えたら姿勢由来の値へつなぐ）
-    gravity_m_per_s2: 9.8
     final_one_euro: {min_cutoff: 3.0, beta: 0.5}  # 最後の軽い平滑化
   reach_ratio: 0.98         # 股関節から足ＩＫまでの距離をこの割合×脚長以下にする（体を支えている脚だけ。接地している脚と、
                             #   足裏が床から contact.exit_height_m 未満の脚。宙にある遊脚に届かせるために体を下げない）

@@ -7,6 +7,15 @@
 宙にある遊脚（前へ蹴り上げた脚・ジャンプ中に伸ばした脚）の足ＩＫに届かなくても、MMD の IK が脚を伸ばしきって
 足が少し手前で止まるだけなので、体全体を下げない（下げると、まっすぐな脚を前へ蹴り上げるたびに体が沈み、軸足の
 膝が曲がる。骨盤を下げても縮むのは距離の鉛直の成分だけなので、脚が水平に近いほど下げ幅が大きくなる）。
+
+ジャンプの滞空（体が宙にあるか）は、ステージ6a（ground.flight。骨盤が重力の放物線を描くことで確かめたもの）だけが
+決める。ここでは判定し直さずに、それを使う:
+
+* 滞空のフレームは、どの脚も体を支えていない（接地の前後へ広げた分や、足ＩＫがまだ床の近くにある分も含めない。
+  踏み切り直後の足ＩＫは境界のブレンドで床の近くに残るので、そこを支える脚にすると、届かないとして体を下げてしまう）
+* 上下の平滑化は滞空をまたがない。滞空の区間は前後の高さを結ぶ直線（地上の動き）と、その上の放物線（跳んだ高さ。
+  両端で 0）に分け、平滑化は地上の動きにだけ掛けて、放物線を足し戻す（滞空をまたいで平滑化すると、跳んだ高さが
+  踏み切りの前・着地の後へ広がって削れ、広がった所では足ＩＫが床にあるので、届く高さのクランプがさらに体を下げる）
 """
 from dataclasses import dataclass
 
@@ -51,18 +60,48 @@ class ReachGeometry:
         return over.any(axis=1)
 
 
-def supporting_legs(flags, sole_heights, near, margin):
+def supporting_legs(flags, sole_heights, near, margin, flight=None):
     """(T, 2) bool 届く高さの判定に使う脚（体を支えている脚）。
 
     flags: (T, 2) 接地判定（前後 margin フレームにも広げる。足ＩＫの境界のブレンドの間も足は床の近くにある）/
     sole_heights: (T, 2) 足ＩＫでのモデルの足裏の床からの高さ（locked.mmd_sole_heights）。near より低い脚も使う
     （接地判定から漏れても床の上にある足は、届かないと浮いて見える）。
+    flight: (T,) bool ジャンプの滞空のフレーム（ステージ6a の ground.flight）。そのフレームはどちらの脚も使わない。
     """
     flags = np.asarray(flags, bool)
     if margin > 0 and len(flags):
         flags = maximum_filter1d(flags.astype(np.uint8), 2 * int(margin) + 1, axis=0,
                                  mode='constant').astype(bool)
-    return flags | (np.asarray(sole_heights, np.float64) < float(near))
+    legs = flags | (np.asarray(sole_heights, np.float64) < float(near))
+    if flight is not None:
+        legs &= ~np.asarray(flight, bool)[:, None]
+    return legs
+
+
+def split_flight(y, flight):
+    """上下の位置 y (T,) を、滞空の区間で「地上の動き」と「跳んだ高さ」に分ける。戻り値 (地上 (T,), 跳んだ高さ (T,))。
+
+    滞空の区間 s〜e では、地上の動きは前後のフレーム s−1・e+1 の高さを結ぶ直線、跳んだ高さはその直線からの高さに
+    当てはめた放物線 c (t − (s−1)) ((e+1) − t)（両端で 0。宙にある体は重力だけで動くので骨盤は放物線を描く。c ≥ 0）。
+    区間の外は、地上の動き = y・跳んだ高さ = 0。先頭・末尾にかかる滞空は分けない（前後の高さが無い）。
+    """
+    y = np.asarray(y, np.float64)
+    ground = y.copy()
+    jump = np.zeros_like(y)
+    if flight is None:
+        return ground, jump
+    T = len(y)
+    for s, e in filters.runs(flight):
+        a, b = s - 1, e + 1
+        if a < 0 or b >= T:
+            continue
+        tau = np.arange(b - a + 1, dtype=np.float64)
+        line = y[a] + (y[b] - y[a]) * tau / (b - a)
+        shape = tau * (b - a - tau)
+        c = max(0.0, float(shape @ (y[a:b + 1] - line)) / float(shape @ shape))
+        ground[a:b + 1] = line
+        jump[a:b + 1] = c * shape
+    return ground, jump
 
 
 @dataclass
@@ -98,8 +137,14 @@ def _hermite(p0, p1, v0, v1, n):
             + h11[:, None] * v1 * L)
 
 
-def pelvis_from_contacts(pelvis, ankles, ik_target, contact, fps, unit, cfg):
-    """モードB: 接地中は「ロックした足ＩＫ位置 + 姿勢から求めた足首→骨盤ベクトル」で骨盤を求める。"""
+def pelvis_from_contacts(pelvis, ankles, ik_target, contact, fps, unit, cfg, flight=None):
+    """モードB: 接地中は「ロックした足ＩＫ位置 + 姿勢から求めた足首→骨盤ベクトル」で骨盤を求める。
+
+    両足とも接地していない区間は、水平は前後の値から 3 次補間し、上下は姿勢由来の骨盤（ステージ6a の後）に前後の差を
+    直線でつないで足す。接地していないことだけでは跳んだとはみなさない（接地判定から漏れた足踏み・踏み替えに放物線を
+    描かない）。跳んだ高さは姿勢由来の骨盤に入っていて、ステージ6a が滞空と確かめた区間（flight）だけ、最後の平滑化を
+    またがずに放物線として足し戻す（split_flight）。
+    """
     T = len(pelvis)
     acc = np.zeros((T, 3))
     cnt = np.zeros(T)
@@ -113,8 +158,6 @@ def pelvis_from_contacts(pelvis, ankles, ik_target, contact, fps, unit, cfg):
     est = np.where(known[:, None], acc / np.maximum(cnt, 1)[:, None], np.nan)
     offset = est - pelvis     # 姿勢由来の骨盤との差
     vel = np.gradient(pelvis, axis=0)
-    g = float(cfg.mode_b.gravity_m_per_s2) * unit
-    max_flight = float(cfg.mode_b.max_flight_sec) * fps
     for s, e in filters.runs(~known):
         n = e - s + 1
         if s == 0 or e == T - 1:
@@ -126,18 +169,14 @@ def pelvis_from_contacts(pelvis, ankles, ik_target, contact, fps, unit, cfg):
         # 水平は 3 次（エルミート）補間
         est[s:e + 1, [0, 2]] = _hermite(est[a, [0, 2]], est[b, [0, 2]],
                                         vel[a, [0, 2]], vel[b, [0, 2]], n)
-        if n <= max_flight:
-            # 上下は重力加速度の放物線（両端の値を通る）
-            tau = np.arange(1, n + 1) / fps
-            D = (n + 1) / fps
-            est[s:e + 1, 1] = (est[a, 1] + (est[b, 1] - est[a, 1]) * tau / D
-                               + 0.5 * g * tau * (D - tau))
-        else:
-            w = np.arange(1, n + 1) / (n + 1.0)
-            est[s:e + 1, 1] = pelvis[s:e + 1, 1] + (1 - w) * offset[a, 1] + w * offset[b, 1]
+        w = np.arange(1, n + 1) / (n + 1.0)
+        est[s:e + 1, 1] = pelvis[s:e + 1, 1] + (1 - w) * offset[a, 1] + w * offset[b, 1]
     fo = cfg.mode_b.final_one_euro
-    return filters.one_euro(est / unit, fps, fo.min_cutoff, fo.beta, cfg.d_cutoff,
-                            cfg.zero_phase) * unit
+    est[:, 1], jump = split_flight(est[:, 1], flight)
+    out = filters.one_euro(est / unit, fps, fo.min_cutoff, fo.beta, cfg.d_cutoff,
+                           cfg.zero_phase) * unit
+    out[:, 1] += jump
+    return out
 
 
 def reach_correction(geom, center_delta, lower_rot, ik_delta, ratio, max_drop, legs=None):
@@ -157,17 +196,22 @@ def reach_correction(geom, center_delta, lower_rot, ik_delta, ratio, max_drop, l
 
 
 def stabilize_center(pelvis_raw, pelvis, pelvis_rest, ankles, ik, contact, geom, lower_rot,
-                     fps, unit, cfg, depth_reconstructed=True, legs=None):
+                     fps, unit, cfg, depth_reconstructed=True, legs=None, flight=None):
     """pelvis_raw: 処理前の骨盤位置 / pelvis: ステージ2 後の骨盤位置（どちらも (T, 3)）。
 
     depth_reconstructed: ステージ6b で骨盤の奥行きを求め直したか（モードA の Z の平滑化の強さを選ぶ）。
     legs: (T, 2) bool 届く高さの判定に使う脚（supporting_legs。None なら両脚）。
+    flight: (T,) bool ジャンプの滞空のフレーム（ステージ6a の ground.flight）。上下の平滑化は滞空をまたがない
+    （split_flight。None ならすべて地上）。
     """
     mode = str(cfg.mode).upper()
     if mode == 'A':
-        smooth = _axis_one_euro(pelvis, fps, unit, cfg, depth_reconstructed)
+        grounded = np.array(pelvis, np.float64, copy=True)
+        grounded[:, 1], jump = split_flight(grounded[:, 1], flight)
+        smooth = _axis_one_euro(grounded, fps, unit, cfg, depth_reconstructed)
+        smooth[:, 1] += jump
     elif mode == 'B':
-        smooth = pelvis_from_contacts(pelvis, ankles, ik.target, contact, fps, unit, cfg)
+        smooth = pelvis_from_contacts(pelvis, ankles, ik.target, contact, fps, unit, cfg, flight)
     else:
         raise ValueError(f'center.mode は A か B です: {cfg.mode}')
     smooth_delta = smooth - pelvis_rest

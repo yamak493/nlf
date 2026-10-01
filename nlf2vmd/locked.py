@@ -192,7 +192,8 @@ def locked_motion(result):
     body = np.zeros((T, 3))
     body[:, 1] = jump
     lower_rot = rt.global_matrix('下半身', kin.glob_rot)
-    # 届く高さは体を支えている脚だけで判定する（フルと同じ。both_feet なら両足とも床にあるので両脚）
+    # 届く高さは体を支えている脚だけで判定する（フルと同じ。both_feet なら両足とも床にあるので両脚）。
+    # ジャンプは体を床へ下ろしてしなかったものにしたので、フルの滞空（ground.flight）は渡さない（足は床にある）
     support = supporting_legs(locked_contact.flags, mmd_sole_heights(result.skeleton, ik),
                               float(cfg.contact.exit_height_m) * k, int(cfg.foot_ik.blend_frames))
     center = stabilize_center(result.kin_raw.root_pos, kin.root_pos - body, result.pelvis_rest,
