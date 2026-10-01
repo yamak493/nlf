@@ -157,8 +157,10 @@ def no_move_motion(result):
     center_delta = np.zeros((T, 3))
     center_delta[:, 1] = center.smoothed[:, 1]
     lower_rot = result.retargeter.global_matrix('下半身', result.kin.glob_rot)
+    # 届く高さを判定する脚はフルと同じ（足ＩＫは水平にずらしただけなので、接地も足裏の高さも変わらない）
     center_delta, _, corr, before, after = apply_reach_clamp(
-        result.reach_geometry, center_delta, lower_rot, ik.delta, result.config.center, k)
+        result.reach_geometry, center_delta, lower_rot, ik.delta, result.config.center, k,
+        getattr(center, 'legs', None))
     info = dict(removed_travel_cm=float(np.linalg.norm(travel, axis=1).max() / k * 100.0),
                 max_drop_cm=float(max(0.0, -corr.min()) / k * 100.0),
                 exceed_before=before, exceed_after=after)

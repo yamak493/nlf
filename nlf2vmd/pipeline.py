@@ -20,7 +20,7 @@ import numpy as np
 from . import diagnostics, quat
 from .arm_collision import MODE_LABELS, OVERLAP_TOL_M, resolve_arm_collisions
 from .body_model import ANKLES, BodyModel, compute_kinematics, forward_kinematics, rest_info
-from .center import ReachGeometry, stabilize_center
+from .center import ReachGeometry, stabilize_center, supporting_legs
 from .config import Config, load_config
 from .contact import detect_contacts
 from .contacts import BODY_PART_LABELS, resolve_contacts
@@ -34,6 +34,7 @@ from .hand_reach import keep_hand_positions
 from .jitter import remove_rotation_outliers, stabilize_pose, stabilize_root
 from .lean import estimate_lean
 from .legs import knee_poles, solve_legs
+from .locked import mmd_sole_heights
 from .motion_io import load_motion, resample, resample_mask
 from .outliers import PART_LABELS, remove_outliers
 from .pmx import PmxModel, read_pmx
@@ -634,13 +635,17 @@ def convert(source, out_path, pmx=None, body_model=None, config=None, overrides=
         warn(f'接地区間の境界で足ＩＫが 1 フレームに {max(steps) / k * 100:.1f} cm 動いています')
 
     # ---- 8. センターの安定化 ----
+    # 届く高さは体を支えている脚（接地している脚と、足裏が床の近くにある脚）だけで判定する（宙にある遊脚に
+    # 届かせるために体全体を下げない）
     geom = ReachGeometry.from_skeleton(skel)
+    support = supporting_legs(contact.flags, mmd_sole_heights(skel, ik),
+                              float(cfg.contact.exit_height_m) * k, int(cfg.foot_ik.blend_frames))
     center = stabilize_center(kin_raw.root_pos, kin.root_pos, pelvis_rest,
                               kin.joints[:, ANKLES], ik, contact, geom,
                               rt.global_matrix('下半身', kin.glob_rot), fps, k, cfg.center,
-                              depth.enabled)
-    log(f'[8] センター（モード {center.mode}）: 脚の伸び切り {center.exceed_before} → '
-        f'{center.exceed_after} フレーム')
+                              depth.enabled, legs=support)
+    log(f'[8] センター（モード {center.mode}）: 体を支えている脚の伸び切り {center.exceed_before} → '
+        f'{center.exceed_after} フレーム（宙にある脚は判定しない）')
     if center.exceed_after:
         warn(f'届く高さへのクランプ後も {center.exceed_after} フレームで脚が伸び切っています')
 

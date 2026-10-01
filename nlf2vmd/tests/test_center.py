@@ -78,3 +78,69 @@ def test_center_z_is_smoothed_harder_without_depth_reconstruction():
     raw = _axis_one_euro(p, 30.0, UNIT, cfg, False)
     np.testing.assert_array_equal(rec[:, :2], raw[:, :2])
     assert np.abs(np.diff(raw[:, 2], 2)).mean() < 0.5 * np.abs(np.diff(rec[:, 2], 2)).mean()
+
+
+def test_reach_clamp_ignores_legs_that_are_not_supporting():
+    """届く高さは、判定する脚（legs）だけで決める。伸び切った脚が判定しない脚なら、センターを下げない。"""
+    cfg = load_config().center
+    geom, center, lower_rot, ik = _setup()
+    legs = np.zeros((len(center), 2), bool)
+    delta, corr_raw, corr, before, after = apply_reach_clamp(geom, center, lower_rot, ik, cfg, UNIT,
+                                                             legs)
+    assert (corr_raw == 0).all() and (corr == 0).all() and before == after == 0
+    np.testing.assert_array_equal(delta, center)
+    # 片脚だけを判定すると、その脚が伸び切るフレームだけ下げる（両脚のときより下げ幅は小さいか同じ）
+    legs[:, 0] = True
+    _, left_raw, _, _, after = apply_reach_clamp(geom, center, lower_rot, ik, cfg, UNIT, legs)
+    _, both_raw, _, _, _ = apply_reach_clamp(geom, center, lower_rot, ik, cfg, UNIT)
+    assert (left_raw >= both_raw - 1e-12).all() and (left_raw < 0).any()
+    assert after == 0
+
+
+def test_supporting_legs():
+    """接地している脚（前後 margin フレームも）と、足裏が床の近くにある脚を、体を支えている脚とする。"""
+    from nlf2vmd.center import supporting_legs
+    flags = np.zeros((20, 2), bool)
+    flags[5:8, 0] = True
+    sole = np.full((20, 2), 0.3)
+    sole[15, 1] = 0.01
+    legs = supporting_legs(flags, sole, 0.05, 2)
+    assert legs[3:10, 0].all() and not legs[:3, 0].any() and not legs[10:, 0].any()
+    assert legs[15, 1] and legs[:, 1].sum() == 1
+
+
+def _kick(peak_deg, fps=30.0, T=120):
+    """右足で立ったまま、左脚をまっすぐ前へ peak_deg まで蹴り上げる（1.0〜2.0 秒）合成モーション。"""
+    from nlf2vmd import quat
+    from nlf2vmd.body_model import ANKLES
+    from nlf2vmd.synthetic import ANKLE_HEIGHT, SMPL_REST_JOINTS as J
+    t = np.arange(T) / fps
+    ang = np.deg2rad(peak_deg) * np.clip(np.sin(np.pi * (t - 1.0)), 0, None) * ((t > 1.0) & (t < 2.0))
+    q = np.tile(quat.IDENTITY, (T, 24, 1))
+    q[:, 1] = quat.from_rotvec(-ang[:, None] * [1.0, 0.0, 0.0])
+    stand = J[0, 1] - J[ANKLES, 1].mean() + ANKLE_HEIGHT
+    pelvis = np.tile([0.0, stand, 0.0], (T, 1))
+    return dict(pose=quat.to_rotvec(q), betas=np.zeros(10), trans=pelvis - J[0], fps=fps,
+                coord_system='yup'), (t > 1.0) & (t < 2.0)
+
+
+def test_kicking_leg_does_not_lower_the_body():
+    """まっすぐな脚を前へ蹴り上げても、遊脚の足ＩＫに届かせるために体全体（センター）を下げない
+    （以前は遊脚も判定したので、股関節 75 度の蹴りで 20cm 沈み、軸足の膝が曲がった）。"""
+    from nlf2vmd.pipeline import convert
+    from nlf2vmd.synthetic import synthetic_body_model
+    from nlf2vmd.variants import variant_tracks
+    bm = synthetic_body_model()
+    for peak in (45.0, 75.0):
+        m, kicking = _kick(peak)
+        r = convert(m, None, body_model=bm, log=None,
+                    overrides=['diagnostics.enabled=false', 'lean.enabled=false'])
+        drop = -r.center.correction / r.scale
+        standing = drop[~kicking].max()                      # 立っているだけの所（両脚がまっすぐ）の下げ幅
+        assert drop[kicking].max() < standing + 0.005        # 蹴っている間も、ほぼ同じ
+        assert not r.center.legs[kicking.nonzero()[0][len(kicking.nonzero()[0]) // 2], 0]   # 蹴り脚は判定しない
+        assert r.center.legs[:, 1].all()                      # 軸足はずっと判定する
+        assert r.center.exceed_after == 0
+        # 接地優先（両足を床に着ける）も、移動なしも同じ判定で作れる
+        variant_tracks(r, 'locked', log=None)
+        variant_tracks(r, 'no_move', log=None)

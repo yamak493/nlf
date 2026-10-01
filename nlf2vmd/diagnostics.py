@@ -20,7 +20,7 @@ METRIC_LABELS = {
     'center_jitter_cm_per_frame2': ('センターの震え', 'センター・グルーブ位置の加速度の絶対値の平均（X, Y, Z）',
                                     '処理前より大幅に減少'),
     'pose_jitter_deg_per_s2': ('姿勢の震え', '関節の角加速度の平均（グループ別）', '処理前より減少'),
-    'overextended_frames': ('脚の伸び切り', '股関節から足ＩＫまでの距離が脚長の98%を超えるフレーム数', '0'),
+    'overextended_frames': ('脚の伸び切り', '体を支えている脚の、股関節から足ＩＫまでの距離が脚長の98%を超えるフレーム数', '0'),
     'contact_segments': ('接地切り替え回数', '足ごとの接地区間の数', '目視との整合を確認'),
     'foot_motion_near_floor_cm_per_frame': (
         '床付近の足の動き', '足が床付近（かかとかつま先が接地終了の高さ未満）にあるときの足ＩＫの移動量の平均（X, Z）',
@@ -143,7 +143,8 @@ def compute_metrics(r):
                                        after=pose_jitter(r.quats, r.fps)),
         'overextended_frames': dict(
             before=int(r.reach_geometry.overextended(r.center.raw, r.lower_rot_raw,
-                                                     raw_ik_delta, r.config.center.reach_ratio)
+                                                     raw_ik_delta, r.config.center.reach_ratio,
+                                                     legs=getattr(r.center, 'legs', None))
                        .sum()),
             before_clamp=r.center.exceed_before,
             after=r.center.exceed_after),

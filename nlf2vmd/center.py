@@ -2,10 +2,16 @@
 
 水平移動はセンター、上下移動はグルーブに分けて出力する。センターをフレーム毎に持ち上げる
 処理はしない（脚が届かない問題は、センターを下げる方向の補正だけで解決する）。
+
+届く高さは、体を支えている脚（supporting_legs: 接地している脚と、足裏が床の近くにある脚）だけで判定する。
+宙にある遊脚（前へ蹴り上げた脚・ジャンプ中に伸ばした脚）の足ＩＫに届かなくても、MMD の IK が脚を伸ばしきって
+足が少し手前で止まるだけなので、体全体を下げない（下げると、まっすぐな脚を前へ蹴り上げるたびに体が沈み、軸足の
+膝が曲がる。骨盤を下げても縮むのは距離の鉛直の成分だけなので、脚が水平に近いほど下げ幅が大きくなる）。
 """
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.ndimage import maximum_filter1d
 
 from . import filters
 from .skeleton import SIDES
@@ -36,9 +42,27 @@ class ReachGeometry:
         hip = self.hip_positions(center_delta, lower_rot)
         return np.linalg.norm(hip - (self.ik + ik_delta), axis=-1)   # (T, 2)
 
-    def overextended(self, center_delta, lower_rot, ik_delta, ratio, tol=1e-6):
+    def overextended(self, center_delta, lower_rot, ik_delta, ratio, tol=1e-6, legs=None):
+        """(T,) bool 脚が伸び切っているフレーム。legs: (T, 2) bool 判定する脚（None なら両脚）。"""
         d = self.distances(center_delta, lower_rot, ik_delta)
-        return (d > ratio * self.leg_length + tol).any(axis=1)
+        over = d > ratio * self.leg_length + tol
+        if legs is not None:
+            over &= np.asarray(legs, bool)
+        return over.any(axis=1)
+
+
+def supporting_legs(flags, sole_heights, near, margin):
+    """(T, 2) bool 届く高さの判定に使う脚（体を支えている脚）。
+
+    flags: (T, 2) 接地判定（前後 margin フレームにも広げる。足ＩＫの境界のブレンドの間も足は床の近くにある）/
+    sole_heights: (T, 2) 足ＩＫでのモデルの足裏の床からの高さ（locked.mmd_sole_heights）。near より低い脚も使う
+    （接地判定から漏れても床の上にある足は、届かないと浮いて見える）。
+    """
+    flags = np.asarray(flags, bool)
+    if margin > 0 and len(flags):
+        flags = maximum_filter1d(flags.astype(np.uint8), 2 * int(margin) + 1, axis=0,
+                                 mode='constant').astype(bool)
+    return flags | (np.asarray(sole_heights, np.float64) < float(near))
 
 
 @dataclass
@@ -51,6 +75,7 @@ class CenterResult:
     exceed_before: int
     exceed_after: int
     mode: str
+    legs: np.ndarray = None      # (T, 2) bool 届く高さの判定に使った脚（None なら両脚）
 
 
 def _axis_one_euro(p, fps, unit, cfg, depth_reconstructed):
@@ -115,22 +140,28 @@ def pelvis_from_contacts(pelvis, ankles, ik_target, contact, fps, unit, cfg):
                             cfg.zero_phase) * unit
 
 
-def reach_correction(geom, center_delta, lower_rot, ik_delta, ratio, max_drop):
-    """各フレームで、両脚が ratio × 脚長 以内に届く最大の骨盤高さへの補正量（≤ 0）を求める。"""
+def reach_correction(geom, center_delta, lower_rot, ik_delta, ratio, max_drop, legs=None):
+    """各フレームで、脚が ratio × 脚長 以内に届く最大の骨盤高さへの補正量（≤ 0）を求める。
+
+    legs: (T, 2) bool 判定する脚（supporting_legs。None なら両脚）。判定しない脚は補正を求めない。
+    """
     hip = geom.hip_positions(center_delta, lower_rot)
     v = hip - (geom.ik + ik_delta)                            # (T, 2, 3)
     limit = ratio * geom.leg_length                            # (2,)
     rhs = limit ** 2 - v[..., 0] ** 2 - v[..., 2] ** 2
     allowed = np.where(rhs >= 0, -v[..., 1] + np.sqrt(np.maximum(rhs, 0)), -v[..., 1])
-    corr = np.minimum(0.0, allowed).min(axis=1)
-    return np.maximum(corr, -max_drop)
+    need = np.minimum(0.0, allowed)
+    if legs is not None:
+        need = np.where(np.asarray(legs, bool), need, 0.0)
+    return np.maximum(need.min(axis=1), -max_drop)
 
 
 def stabilize_center(pelvis_raw, pelvis, pelvis_rest, ankles, ik, contact, geom, lower_rot,
-                     fps, unit, cfg, depth_reconstructed=True):
+                     fps, unit, cfg, depth_reconstructed=True, legs=None):
     """pelvis_raw: 処理前の骨盤位置 / pelvis: ステージ2 後の骨盤位置（どちらも (T, 3)）。
 
     depth_reconstructed: ステージ6b で骨盤の奥行きを求め直したか（モードA の Z の平滑化の強さを選ぶ）。
+    legs: (T, 2) bool 届く高さの判定に使う脚（supporting_legs。None なら両脚）。
     """
     mode = str(cfg.mode).upper()
     if mode == 'A':
@@ -141,19 +172,20 @@ def stabilize_center(pelvis_raw, pelvis, pelvis_rest, ankles, ik, contact, geom,
         raise ValueError(f'center.mode は A か B です: {cfg.mode}')
     smooth_delta = smooth - pelvis_rest
     delta, corr_raw, corr, before, after = apply_reach_clamp(
-        geom, smooth_delta, lower_rot, ik.delta, cfg, unit)
+        geom, smooth_delta, lower_rot, ik.delta, cfg, unit, legs)
     return CenterResult(delta, smooth_delta, pelvis_raw - pelvis_rest, corr_raw, corr, before,
-                        after, mode)
+                        after, mode, legs)
 
 
-def apply_reach_clamp(geom, center_delta, lower_rot, ik_delta, cfg, unit):
+def apply_reach_clamp(geom, center_delta, lower_rot, ik_delta, cfg, unit, legs=None):
     """届く高さへのクランプ（両モード共通）。下げる方向の補正だけを掛ける。
 
+    legs: (T, 2) bool 判定する脚（supporting_legs。None なら両脚）。伸び切ったフレームもこの脚だけで数える。
     戻り値: (補正後の差分, フレーム毎の補正量, 適用した補正量, 補正前の超過フレーム数, 補正後の超過フレーム数)
     """
     ratio = float(cfg.reach_ratio)
     corr_raw = reach_correction(geom, center_delta, lower_rot, ik_delta, ratio,
-                                float(cfg.reach_max_drop_m) * unit)
+                                float(cfg.reach_max_drop_m) * unit, legs)
     # 普通の平滑化だけだとピークが削れて許容高さを超えるので、先に移動最小値で谷を広げる。
     # ガウシアンのカーネルを移動最小値の窓の半分で打ち切ると、平滑化後の値はどのフレームでも
     # そのフレームで必要な補正量以下（= 十分に下げる側）になる
@@ -164,6 +196,6 @@ def apply_reach_clamp(geom, center_delta, lower_rot, ik_delta, cfg, unit):
     delta = np.array(center_delta, np.float64, copy=True)
     delta[:, 1] += corr
     # 適用後に再判定する（脚長を超えて届かない位置や、下げ幅の上限に当たったフレームが残りうる）
-    before = int(geom.overextended(center_delta, lower_rot, ik_delta, ratio).sum())
-    after = int(geom.overextended(delta, lower_rot, ik_delta, ratio).sum())
+    before = int(geom.overextended(center_delta, lower_rot, ik_delta, ratio, legs=legs).sum())
+    after = int(geom.overextended(delta, lower_rot, ik_delta, ratio, legs=legs).sum())
     return delta, corr_raw, corr, before, after

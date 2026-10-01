@@ -38,7 +38,7 @@ from scipy.ndimage import maximum_filter1d
 
 from . import filters, quat
 from .body_model import ANKLES
-from .center import apply_reach_clamp, stabilize_center
+from .center import apply_reach_clamp, stabilize_center, supporting_legs
 from .contact import ContactResult, clean_flags, hysteresis
 from .foot_ik import build_foot_ik, mmd_sole_points, sole_floor_levels
 from .ground import support_height
@@ -192,13 +192,16 @@ def locked_motion(result):
     body = np.zeros((T, 3))
     body[:, 1] = jump
     lower_rot = rt.global_matrix('下半身', kin.glob_rot)
+    # 届く高さは体を支えている脚だけで判定する（フルと同じ。both_feet なら両足とも床にあるので両脚）
+    support = supporting_legs(locked_contact.flags, mmd_sole_heights(result.skeleton, ik),
+                              float(cfg.contact.exit_height_m) * k, int(cfg.foot_ik.blend_frames))
     center = stabilize_center(result.kin_raw.root_pos, kin.root_pos - body, result.pelvis_rest,
                               kin.joints[:, ANKLES] - body[:, None], ik, locked_contact,
-                              result.reach_geometry, lower_rot, fps, k, cfg.center)
+                              result.reach_geometry, lower_rot, fps, k, cfg.center, legs=support)
     smoothed = np.array(center.smoothed, copy=True)
     smoothed[:, [0, 2]] = result.center.smoothed[:, [0, 2]]
     delta, corr_raw, corr, exceed_before, exceed_after = apply_reach_clamp(
-        result.reach_geometry, smoothed, lower_rot, ik.delta, cfg.center, k)
+        result.reach_geometry, smoothed, lower_rot, ik.delta, cfg.center, k, support)
     center = replace(center, delta=delta, smoothed=smoothed, correction_raw=corr_raw,
                      correction=corr, exceed_before=exceed_before, exceed_after=exceed_after)
 

@@ -201,7 +201,8 @@ center:
     max_flight_sec: 0.6     # 両足が離れた区間がこれ以下なら上下を放物線で補間（超えたら姿勢由来の値へつなぐ）
     gravity_m_per_s2: 9.8
     final_one_euro: {min_cutoff: 3.0, beta: 0.5}  # 最後の軽い平滑化
-  reach_ratio: 0.98         # 股関節から足ＩＫまでの距離をこの割合×脚長以下にする
+  reach_ratio: 0.98         # 股関節から足ＩＫまでの距離をこの割合×脚長以下にする（体を支えている脚だけ。接地している脚と、
+                            #   足裏が床から contact.exit_height_m 未満の脚。宙にある遊脚に届かせるために体を下げない）
   reach_min_window: 9       # 補正量カーブの移動最小値フィルタの窓幅
   reach_gaussian_sigma: 2.0 # 続けて掛けるガウシアンの σ（フレーム）
   reach_max_drop_m: 0.3     # 1 フレームで下げる量の上限（誤推定で極端に沈まないための保険）
